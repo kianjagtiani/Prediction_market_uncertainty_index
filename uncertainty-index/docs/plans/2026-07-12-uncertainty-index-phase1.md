@@ -731,6 +731,38 @@ git commit -m "feat: polymarket ingestion (gamma metadata + clob daily closes)"
 
 > NOTE: prices in Kalshi candles are cents (divide by 100); notional ≈ contracts × price in dollars. Confirmed/corrected at the Task 2 checkpoint.
 
+> **CHECKPOINT CORRECTIONS (Task 2 probe, see `docs/probe-findings.md`):** the
+> actual Kalshi market object differs from the code below in three ways —
+> corrected here per the plan's own checkpoint instruction:
+> 1. There is **no `category` field on the market object** — category lives
+>    on the event/series, one API call away. Do not add that extra call;
+>    set `venue_category=""` for Kalshi and rely on keyword categorization
+>    in `normalize.py`. Document this as a known taxonomy limitation
+>    (Task 12 §5) — Kalshi sports exclusion relies on keywords only, not
+>    venue category.
+> 2. There is no `volume` field — use `volume_fp` (a **string**, e.g.
+>    `"0.00"`; cast to float).
+> 3b. Candlestick price fields are **`price.close_dollars`** (a decimal
+     string already on the 0-1 probability scale, e.g. `"0.0100"`), not
+     `price.close` in cents as the code below assumed — confirmed live
+     against a real settled `KXHIGHNY` market. Cast directly to float, do
+     **not** divide by 100. The candle-level volume field is `volume_fp`
+     (string), not `volume`. `tests/fixtures/kalshi_candles.json` has been
+     replaced with this real 2-candle sample so the ingestion test has
+     actual data to check, not the earlier empty-array fixture.
+ 3. `series_ticker` is usually absent from the market object, and the
+>    naive `event_ticker.split("-")[0]` prefix is sometimes wrong for the
+>    candlestick endpoint — some 2024-era series need the bare prefix
+>    (`HIGHNY`), current series need a `KX`-prefixed one (`KXHIGHNY`,
+>    `KXRHGOLD`), and it's not always predictable which. `fetch_candles`
+>    must try the derived prefix first, then retry once with a `KX`-prefixed
+>    variant if the first attempt 404s or returns zero candles. Markets
+>    where both attempts come up empty are expected for the pre-2026
+>    backfill window per the checkpoint finding (zero historical Kalshi
+>    volume) — `candles_to_df` already returns an empty frame gracefully,
+>    and `universe.py`'s liquidity floor excludes them; this is not an
+>    error condition, do not raise or log it as one.
+
 - [ ] **Step 1: Write the failing tests**
 
 `tests/test_ingest_kalshi.py`:
@@ -800,12 +832,14 @@ def markets_to_df(markets: list[dict]) -> pd.DataFrame:
             "market_id": f"ka_{m['ticker']}",
             "venue": "kalshi",
             "question": m.get("title") or "",
-            "venue_category": (m.get("category") or "").strip(),
+            # No category field on the market object (Task 2 checkpoint) -
+            # categorization falls back to keyword rules only for Kalshi.
+            "venue_category": "",
             "event_ticker": m["event_ticker"],
             "ticker": m["ticker"],
             "series_ticker": series,
-            # volume is contracts; ~$0.50 avg price is a fair notional proxy
-            "total_volume_usd": float(m.get("volume") or 0) * 0.5,
+            # volume_fp is contracts (string); ~$0.50 avg price is a fair notional proxy
+            "total_volume_usd": float(m.get("volume_fp") or 0) * 0.5,
             "open_date": m.get("open_time"),
             "close_date": m.get("close_time"),
         })
@@ -819,11 +853,11 @@ def candles_to_df(payload: dict, market_id: str) -> pd.DataFrame:
     candles = payload.get("candlesticks", [])
     rows = []
     for c in candles:
-        close_cents = (c.get("price") or {}).get("close")
-        if close_cents is None:
+        close_dollars = (c.get("price") or {}).get("close_dollars")
+        if close_dollars is None:
             continue
-        close_prob = close_cents / 100.0
-        volume = float(c.get("volume") or 0)
+        close_prob = float(close_dollars)  # already 0-1 scale, not cents
+        volume = float(c.get("volume_fp") or 0)
         rows.append({
             "market_id": market_id,
             "date": pd.to_datetime(c["end_period_ts"], unit="s", utc=True)
@@ -856,9 +890,21 @@ def fetch_all_markets(client: httpx.Client) -> list[dict]:
 
 def fetch_candles(client: httpx.Client, series: str, ticker: str,
                   start_ts: int, end_ts: int) -> dict:
-    r = client.get(f"{BASE}/series/{series}/markets/{ticker}/candlesticks",
-                   params={"start_ts": start_ts, "end_ts": end_ts,
-                           "period_interval": 1440})
+    def _get(s: str) -> httpx.Response:
+        return client.get(f"{BASE}/series/{s}/markets/{ticker}/candlesticks",
+                          params={"start_ts": start_ts, "end_ts": end_ts,
+                                  "period_interval": 1440})
+
+    r = _get(series)
+    empty = r.status_code == 200 and not r.json().get("candlesticks")
+    if r.status_code == 404 or empty:
+        # Some series need a KX-prefixed ticker for the candlestick path
+        # even though the market/event catalog uses the bare prefix
+        # (Task 2 checkpoint finding). Retry once with that variant.
+        if not series.startswith("KX"):
+            r2 = _get(f"KX{series}")
+            if r2.status_code == 200:
+                r = r2
     r.raise_for_status()
     return r.json()
 
