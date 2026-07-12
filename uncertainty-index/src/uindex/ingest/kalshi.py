@@ -1,7 +1,6 @@
 """Kalshi ingestion: public trade API v2 markets + daily candlesticks."""
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 import httpx
 import pandas as pd
