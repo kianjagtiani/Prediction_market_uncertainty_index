@@ -11,7 +11,11 @@ from .. import config
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 HISTORY_URL = "https://clob.polymarket.com/prices-history"
 OUT_DIR = config.DATA_DIR / "raw" / "polymarket"
-SLEEP_S = 0.3  # adjust per Task 2 rate-limit findings
+
+MARKETS_COLUMNS = [
+    "market_id", "venue", "question", "venue_category",
+    "yes_token_id", "total_volume_usd", "open_date", "close_date",
+]
 
 
 def markets_to_df(markets: list[dict]) -> pd.DataFrame:
@@ -30,6 +34,8 @@ def markets_to_df(markets: list[dict]) -> pd.DataFrame:
             "open_date": m.get("startDate"),
             "close_date": m.get("endDate"),
         })
+    if not rows:
+        return pd.DataFrame(columns=MARKETS_COLUMNS)
     df = pd.DataFrame(rows)
     for col in ("open_date", "close_date"):
         df[col] = pd.to_datetime(df[col], utc=True, errors="coerce").dt.tz_localize(None)
@@ -54,7 +60,7 @@ def fetch_all_markets(client: httpx.Client) -> list[dict]:
     out, offset = [], 0
     while True:
         r = client.get(GAMMA_URL, params={
-            "limit": 500, "offset": offset,
+            "limit": config.POLYMARKET_PAGE_SIZE, "offset": offset,
             "end_date_min": config.BACKFILL_START,
         })
         r.raise_for_status()
@@ -62,13 +68,14 @@ def fetch_all_markets(client: httpx.Client) -> list[dict]:
         if not batch:
             return out
         out.extend(batch)
-        offset += 500
-        time.sleep(SLEEP_S)
+        offset += config.POLYMARKET_PAGE_SIZE
+        time.sleep(config.POLYMARKET_SLEEP_S)
 
 
 def fetch_history(client: httpx.Client, token_id: str) -> dict:
     r = client.get(HISTORY_URL, params={
-        "market": token_id, "interval": "max", "fidelity": 1440,
+        "market": token_id, "interval": "max",
+        "fidelity": config.POLYMARKET_HISTORY_FIDELITY,
     })
     r.raise_for_status()
     return r.json()
@@ -101,7 +108,7 @@ def main() -> None:
                                         row.market_id))
         except httpx.HTTPStatusError as e:
             print(f"skip {row.market_id}: {e.response.status_code}")
-        time.sleep(SLEEP_S)
+        time.sleep(config.POLYMARKET_SLEEP_S)
         if i % 200 == 199:  # checkpoint so the run is resumable
             pd.concat(frames, ignore_index=True).to_parquet(prices_path, index=False)
             print(f"checkpoint: {i + 1}/{len(todo)}")

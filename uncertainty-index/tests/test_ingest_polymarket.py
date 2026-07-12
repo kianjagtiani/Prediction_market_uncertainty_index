@@ -30,6 +30,25 @@ def test_markets_without_tokens_are_dropped():
     assert "pm_999" not in set(df["market_id"])
 
 
+def test_markets_to_df_empty_list():
+    df = pm.markets_to_df([])
+    assert list(df.columns) == [
+        "market_id", "venue", "question", "venue_category",
+        "yes_token_id", "total_volume_usd", "open_date", "close_date",
+    ]
+    assert len(df) == 0
+
+
+def test_markets_to_df_all_filtered_out():
+    broken = [{"id": "1", "question": "no tokens", "clobTokenIds": "[]"}]
+    df = pm.markets_to_df(broken)
+    assert list(df.columns) == [
+        "market_id", "venue", "question", "venue_category",
+        "yes_token_id", "total_volume_usd", "open_date", "close_date",
+    ]
+    assert len(df) == 0
+
+
 def test_history_to_df_daily_close():
     payload = json.loads((FIXTURES / "pm_prices.json").read_text())
     df = pm.history_to_df(payload, market_id="pm_1")
