@@ -22,6 +22,11 @@ POLYMARKET_SLEEP_S = 0.3  # adjust per Task 2 rate-limit findings
 POLYMARKET_PAGE_SIZE = 500
 POLYMARKET_HISTORY_FIDELITY = 1440
 
+# Kalshi ingestion
+KALSHI_SLEEP_S = 0.15  # adjust per Task 2 rate-limit findings
+KALSHI_PAGE_SIZE = 1000
+KALSHI_CANDLE_PERIOD_INTERVAL_MINUTES = 1440
+
 INDEXES = ["GLOBAL", "WAR", "ELECTIONS", "POLITICS", "ECON_FED",
            "CRYPTO", "TECH_AI", "CLIMATE"]
 
