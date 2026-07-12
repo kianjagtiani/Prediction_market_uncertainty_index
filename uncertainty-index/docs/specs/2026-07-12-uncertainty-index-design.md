@@ -59,7 +59,7 @@ A market qualifies on day *t* only using information available on day *t*:
 - Liquidity above a floor (tunable; robustness-checked).
 - More than N days from scheduled resolution (guards the settlement artifact: probabilities collapsing to 0/1 near resolution create fake turbulence — the single biggest artifact to prevent).
 - Deduplicated: near-identical markets within and across venues count once (keyword/entity matching + manual override list).
-- Kalshi multi-strike series (e.g., a dozen "CPI above X%" strikes on one event) are grouped as one event; a representative strike or aggregate is used so one event isn't counted twelve times.
+- Kalshi multi-strike series (e.g., a dozen "CPI above X%" strikes on one event) are grouped as one event, represented by the most liquid strike in the group, so one event isn't counted twelve times.
 
 Universe churn (markets entering/leaving) must not mechanically jump the index; aggregation is a weighted mean (not a sum), and churn effects are explicitly checked in validation.
 
