@@ -22,7 +22,7 @@ def categorize(question: str, venue_category: str) -> str:
 
 def build_panel(pm_meta: pd.DataFrame, pm_prices: pd.DataFrame,
                 ka_meta: pd.DataFrame, ka_prices: pd.DataFrame
-                ) -> tuple[pd.DataFrame, pd.DataFrame]:
+                ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     pm = pm_meta.copy()
     pm["event_ticker"] = np.nan
     ka = ka_meta.copy()
@@ -38,8 +38,7 @@ def build_panel(pm_meta: pd.DataFrame, pm_prices: pd.DataFrame,
     panel = pd.concat([pmp, ka_prices], ignore_index=True)
     panel = panel.merge(meta[["market_id"]], on="market_id", how="inner")
     panel = panel.sort_values(["market_id", "date"]).reset_index(drop=True)
-    build_panel.last_dropped = dropped  # exposed for the CLI triage log
-    return meta.reset_index(drop=True), panel
+    return meta.reset_index(drop=True), panel, dropped
 
 
 def main() -> None:
@@ -47,7 +46,7 @@ def main() -> None:
     out = config.DATA_DIR / "normalized"
     out.mkdir(parents=True, exist_ok=True)
 
-    meta, panel = build_panel(
+    meta, panel, dropped = build_panel(
         pd.read_parquet(raw / "polymarket" / "markets.parquet"),
         pd.read_parquet(raw / "polymarket" / "prices.parquet"),
         pd.read_parquet(raw / "kalshi" / "markets.parquet"),
@@ -56,7 +55,6 @@ def main() -> None:
     meta.to_parquet(out / "meta.parquet", index=False)
     panel.to_parquet(out / "panel.parquet", index=False)
 
-    dropped = build_panel.last_dropped
     triage = dropped[dropped["category"] == "UNMAPPED"]
     triage[["market_id", "venue", "question", "venue_category",
             "total_volume_usd"]].to_csv(out / "unmapped_triage.csv", index=False)

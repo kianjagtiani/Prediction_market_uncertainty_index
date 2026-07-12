@@ -51,7 +51,7 @@ def _tiny_inputs():
 
 
 def test_build_panel_drops_sports_and_unifies():
-    meta, panel = normalize.build_panel(*_tiny_inputs())
+    meta, panel, dropped = normalize.build_panel(*_tiny_inputs())
     assert set(meta["market_id"]) == {"pm_1", "ka_X"}  # Lakers dropped
     assert set(meta.columns) == {
         "market_id", "venue", "question", "category", "event_ticker",
