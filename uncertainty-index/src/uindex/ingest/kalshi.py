@@ -9,7 +9,6 @@ from .. import config
 
 BASE = "https://api.elections.kalshi.com/trade-api/v2"
 OUT_DIR = config.DATA_DIR / "raw" / "kalshi"
-SLEEP_S = 0.15  # adjust per Task 2 rate-limit findings
 
 
 def markets_to_df(markets: list[dict]) -> pd.DataFrame:
@@ -66,7 +65,7 @@ def fetch_all_markets(client: httpx.Client) -> list[dict]:
                     .replace(tzinfo=timezone.utc).timestamp())
     out, cursor = [], None
     while True:
-        params = {"limit": 1000, "min_close_ts": min_close}
+        params = {"limit": config.KALSHI_PAGE_SIZE, "min_close_ts": min_close}
         if cursor:
             params["cursor"] = cursor
         r = client.get(f"{BASE}/markets", params=params)
@@ -76,7 +75,7 @@ def fetch_all_markets(client: httpx.Client) -> list[dict]:
         cursor = j.get("cursor")
         if not cursor:
             return out
-        time.sleep(SLEEP_S)
+        time.sleep(config.KALSHI_SLEEP_S)
 
 
 def fetch_candles(client: httpx.Client, series: str, ticker: str,
@@ -90,21 +89,32 @@ def fetch_candles(client: httpx.Client, series: str, ticker: str,
     not predictable which ahead of time (Task 2 checkpoint correction 3).
     Try the derived prefix first, then retry once with a KX-prefixed
     variant if the first attempt 404s or returns zero candles. If both
-    attempts come up empty, that's expected for the pre-2026 backfill
-    window (zero historical Kalshi volume) - not an error condition.
+    attempts come up empty (or the retry also fails to find the market),
+    that's expected for the pre-2026 backfill window (zero historical
+    Kalshi volume) - not an error condition, so an empty-candlesticks
+    payload is returned rather than raising. Only genuinely unexpected
+    errors (5xx, network failures) still propagate.
     """
     def _get(s: str) -> httpx.Response:
         return client.get(f"{BASE}/series/{s}/markets/{ticker}/candlesticks",
                           params={"start_ts": start_ts, "end_ts": end_ts,
-                                  "period_interval": 1440})
+                                  "period_interval": config.KALSHI_CANDLE_PERIOD_INTERVAL_MINUTES})
 
     r = _get(series)
     empty = r.status_code == 200 and not r.json().get("candlesticks")
     if r.status_code == 404 or empty:
-        if not series.startswith("KX"):
+        if series.startswith("KX"):
+            # No further fallback prefix to try.
+            if r.status_code == 404:
+                return {"candlesticks": []}
+        else:
             r2 = _get(f"KX{series}")
             if r2.status_code == 200:
-                r = r2
+                return r2.json()
+            if r2.status_code == 404:
+                # Both prefixes 404: no historical data available, not an error.
+                return {"candlesticks": []}
+            r2.raise_for_status()
     r.raise_for_status()
     return r.json()
 
@@ -138,7 +148,7 @@ def main() -> None:
             frames.append(candles_to_df(payload, row.market_id))
         except httpx.HTTPStatusError as e:
             print(f"skip {row.market_id}: {e.response.status_code}")
-        time.sleep(SLEEP_S)
+        time.sleep(config.KALSHI_SLEEP_S)
         if i % 200 == 199:
             pd.concat(frames, ignore_index=True).to_parquet(prices_path, index=False)
             print(f"checkpoint: {i + 1}/{len(todo)}")
