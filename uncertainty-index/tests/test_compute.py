@@ -58,3 +58,28 @@ def test_percentile_scale_seed_and_range():
     # monotone series: every post-seed day is a new max -> 100
     assert (scaled.iloc[SEED_DAYS:] == 100.0).all()
     assert scaled.max() <= 100 and scaled.min() >= 0
+
+
+def test_percentile_scale_current_nan_stays_nan():
+    # A day with no value must stay NaN, not silently read as "0th percentile".
+    idx = pd.date_range("2024-01-01", periods=5, freq="D")
+    raw = pd.Series([1.0, 2.0, np.nan, 3.0, 4.0], index=idx)
+    scaled = compute.percentile_scale(raw, seed_days=0)
+    assert np.isnan(scaled.iloc[2])
+    # index 0 is also NaN (expanding min_periods=2 has no prior history yet),
+    # not the behavior under test here - check the rest are real values.
+    assert not scaled.iloc[[1, 3, 4]].isna().any()
+
+
+def test_percentile_scale_ignores_gaps_in_history():
+    # A NaN gap in history must not count as an automatic non-match for
+    # later days (raw=True positional comparison would otherwise dilute
+    # the percentile of every subsequent value).
+    idx = pd.date_range("2024-01-01", periods=5, freq="D")
+    with_gap = pd.Series([1.0, 2.0, np.nan, 3.0, 100.0], index=idx)
+    without_gap = pd.Series([1.0, 2.0, 3.0, 100.0],
+                            index=idx.delete(2))
+    scaled_gap = compute.percentile_scale(with_gap, seed_days=0)
+    scaled_nogap = compute.percentile_scale(without_gap, seed_days=0)
+    assert scaled_gap.iloc[-1] == scaled_nogap.iloc[-1] == 100.0
+    assert scaled_gap.iloc[3] == scaled_nogap.iloc[2]  # value 3.0 in both

@@ -1,8 +1,7 @@
 """Turn a flagged panel into daily index series (both gauges, all indices)."""
-import numpy as np
 import pandas as pd
 
-from . import compute, config, normalize, universe
+from . import compute, config, universe
 
 
 def _index_series(sub: pd.DataFrame, ewma_halflife: float) -> pd.DataFrame:
@@ -46,13 +45,7 @@ def compute_indices(flagged_panel: pd.DataFrame,
         series = _index_series(sub, p["ewma_halflife"])
         for gauge in ("turbulence", "unresolvedness"):
             raw = series[gauge]
-            # percentile_scale ranks positionally (raw=True expanding window);
-            # leading NaNs from EWMA warm-up would count as automatic
-            # non-matches (NaN <= x is False), diluting early percentiles.
-            # Rank against valid history only, then realign to all dates.
-            valid = raw.dropna()
-            scaled = compute.percentile_scale(
-                valid, seed_days=p["seed_days"]).reindex(raw.index)
+            scaled = compute.percentile_scale(raw, seed_days=p["seed_days"])
             tidy.append(pd.DataFrame({
                 "date": series.index, "index": index_name, "gauge": gauge,
                 "raw": raw.values, "value": scaled.values,

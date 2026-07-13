@@ -38,10 +38,15 @@ def weighted_mean(values: pd.Series, weights: pd.Series) -> float:
 def percentile_scale(raw: pd.Series, seed_days: int = config.SEED_DAYS) -> pd.Series:
     """Expanding percentile of each value vs strictly-prior history, 0-100.
 
-    First seed_days values are NaN (seed period, not publishable).
+    First seed_days *valid* values are NaN (seed period, not publishable).
+    NaN entries in `raw` (no data that day) are excluded from the ranking
+    entirely and stay NaN in the output - `raw=True` positional comparison
+    would otherwise treat "NaN <= x" as a non-match, diluting percentiles
+    around any gap and reporting 0.0 (not NaN) on a day with no value.
     """
-    scaled = raw.expanding(min_periods=2).apply(
+    valid = raw.dropna()
+    scaled = valid.expanding(min_periods=2).apply(
         lambda w: float((w[:-1] <= w[-1]).mean() * 100.0), raw=True
     )
     scaled.iloc[:seed_days] = np.nan
-    return scaled
+    return scaled.reindex(raw.index)
