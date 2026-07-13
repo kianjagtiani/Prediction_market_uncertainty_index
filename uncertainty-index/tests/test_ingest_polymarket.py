@@ -49,6 +49,42 @@ def test_markets_to_df_all_filtered_out():
     assert len(df) == 0
 
 
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+class _FakeKeysetClient:
+    """Serves two pages keyed by cursor, recording each request's params."""
+
+    def __init__(self):
+        self.calls = []
+        self._pages = {
+            None: {"markets": [{"id": "1"}, {"id": "2"}], "next_cursor": "abc"},
+            "abc": {"markets": [{"id": "3"}], "next_cursor": None},
+        }
+
+    def get(self, url, params):
+        assert url == pm.GAMMA_KEYSET_URL
+        self.calls.append(params)
+        return _FakeResponse(self._pages[params.get("cursor")])
+
+
+def test_fetch_all_markets_follows_keyset_cursor(monkeypatch):
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    client = _FakeKeysetClient()
+    markets = pm.fetch_all_markets(client)
+    assert [m["id"] for m in markets] == ["1", "2", "3"]
+    assert "cursor" not in client.calls[0]  # first page has no cursor
+    assert client.calls[1]["cursor"] == "abc"
+
+
 def test_history_to_df_daily_close():
     payload = json.loads((FIXTURES / "pm_prices.json").read_text())
     df = pm.history_to_df(payload, market_id="pm_1")

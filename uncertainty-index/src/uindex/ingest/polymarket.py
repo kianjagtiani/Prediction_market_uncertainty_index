@@ -8,7 +8,7 @@ import pandas as pd
 
 from .. import config
 
-GAMMA_URL = "https://gamma-api.polymarket.com/markets"
+GAMMA_KEYSET_URL = "https://gamma-api.polymarket.com/markets/keyset"
 HISTORY_URL = "https://clob.polymarket.com/prices-history"
 OUT_DIR = config.DATA_DIR / "raw" / "polymarket"
 
@@ -57,18 +57,26 @@ def history_to_df(payload: dict, market_id: str) -> pd.DataFrame:
 
 
 def fetch_all_markets(client: httpx.Client) -> list[dict]:
-    out, offset = [], 0
+    # Plain offset pagination 422s past a few thousand results ("offset too
+    # large, use /markets/keyset for deeper pagination" - confirmed live
+    # during the Task 9 backfill run). The keyset endpoint also silently
+    # caps each page at 100 regardless of the requested limit.
+    out, cursor = [], None
     while True:
-        r = client.get(GAMMA_URL, params={
-            "limit": config.POLYMARKET_PAGE_SIZE, "offset": offset,
-            "end_date_min": config.BACKFILL_START,
-        })
+        params = {"limit": config.POLYMARKET_PAGE_SIZE,
+                  "end_date_min": config.BACKFILL_START}
+        if cursor:
+            params["cursor"] = cursor
+        r = client.get(GAMMA_KEYSET_URL, params=params)
         r.raise_for_status()
-        batch = r.json()
+        payload = r.json()
+        batch = payload.get("markets", [])
         if not batch:
             return out
         out.extend(batch)
-        offset += config.POLYMARKET_PAGE_SIZE
+        cursor = payload.get("next_cursor")
+        if not cursor:
+            return out
         time.sleep(config.POLYMARKET_SLEEP_S)
 
 
