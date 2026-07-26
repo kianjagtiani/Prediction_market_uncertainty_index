@@ -1,6 +1,5 @@
 """Compare GLOBAL turbulence to VIX, EPU, GPR: correlation + lead-lag."""
 import json
-from pathlib import Path
 
 import httpx
 import matplotlib
@@ -44,19 +43,25 @@ def _download() -> dict[str, pd.Series]:
     out = {}
 
     raw = BENCH_DIR / "vix.csv"
-    raw.write_bytes(client.get(SOURCES["VIX"]).content)
+    r = client.get(SOURCES["VIX"])
+    r.raise_for_status()
+    raw.write_bytes(r.content)
     vix = pd.read_csv(raw, na_values=".")
     vix.columns = ["date", "vix"]
     out["VIX"] = vix.assign(date=pd.to_datetime(vix["date"])).set_index("date")["vix"]
 
     raw = BENCH_DIR / "epu.csv"
-    raw.write_bytes(client.get(SOURCES["EPU"]).content)
+    r = client.get(SOURCES["EPU"])
+    r.raise_for_status()
+    raw.write_bytes(r.content)
     epu = pd.read_csv(raw)
     epu["date"] = pd.to_datetime(epu[["year", "month", "day"]])
     out["EPU"] = epu.set_index("date")["daily_policy_index"]
 
     raw = BENCH_DIR / "gpr.xls"
-    raw.write_bytes(client.get(SOURCES["GPR"]).content)
+    r = client.get(SOURCES["GPR"])
+    r.raise_for_status()
+    raw.write_bytes(r.content)
     gpr = pd.read_excel(raw)
     gpr.columns = [c.lower() for c in gpr.columns]
     out["GPR"] = gpr.assign(date=pd.to_datetime(gpr["date"])).set_index("date")["gprd"]
