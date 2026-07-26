@@ -60,14 +60,19 @@ class _FakeResponse:
         return self._payload
 
 
+def _api_market(mid):
+    return {"id": mid, "question": f"q{mid}", "clobTokenIds": f'["{mid}00"]'}
+
+
 class _FakeKeysetClient:
-    """Serves two pages keyed by cursor, recording each request's params."""
+    """Serves pages keyed by cursor, recording each request's params."""
 
     def __init__(self):
         self.calls = []
         self._pages = {
-            None: {"markets": [{"id": "1"}, {"id": "2"}], "next_cursor": "abc"},
-            "abc": {"markets": [{"id": "3"}], "next_cursor": None},
+            None: {"markets": [_api_market("1"), _api_market("2")],
+                   "next_cursor": "abc"},
+            "abc": {"markets": [_api_market("3")], "next_cursor": None},
         }
 
     def get(self, url, params):
@@ -76,13 +81,30 @@ class _FakeKeysetClient:
         return _FakeResponse(self._pages[params.get("cursor")])
 
 
-def test_fetch_all_markets_follows_keyset_cursor(monkeypatch):
+def test_fetch_all_markets_streams_pages_to_slim_df(monkeypatch):
+    # Returns a converted DataFrame, not raw dicts: accumulating raw market
+    # dicts for the full catalog previously drove ingestion to multi-GB RSS.
     monkeypatch.setattr(pm.time, "sleep", lambda s: None)
     client = _FakeKeysetClient()
-    markets = pm.fetch_all_markets(client)
-    assert [m["id"] for m in markets] == ["1", "2", "3"]
+    df = pm.fetch_all_markets(client)
+    assert isinstance(df, pd.DataFrame)
+    assert list(df.columns) == pm.MARKETS_COLUMNS
+    assert list(df["market_id"]) == ["pm_1", "pm_2", "pm_3"]
     assert "cursor" not in client.calls[0]  # first page has no cursor
     assert client.calls[1]["cursor"] == "abc"
+
+
+def test_history_todo_skips_done_and_below_volume_floor():
+    from uindex import config
+    floor = config.POLYMARKET_MIN_TOTAL_VOLUME_USD
+    meta = pd.DataFrame({
+        "market_id": ["pm_1", "pm_2", "pm_3"],
+        # At-floor markets survive the universe filter (< floor excludes),
+        # so they must still get history fetched.
+        "total_volume_usd": [floor, floor - 1, floor * 10],
+    })
+    todo = pm.history_todo(meta, done={"pm_3"})
+    assert list(todo["market_id"]) == ["pm_1"]
 
 
 def test_history_to_df_daily_close():

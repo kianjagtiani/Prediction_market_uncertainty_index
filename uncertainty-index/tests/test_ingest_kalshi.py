@@ -44,6 +44,55 @@ def test_markets_to_df_total_volume_usd_from_volume_fp():
     assert df["total_volume_usd"].iloc[0] == 100.0
 
 
+def _api_market(ticker):
+    return {
+        "ticker": ticker,
+        "event_ticker": ticker.split("-")[0],
+        "title": f"Market {ticker}",
+        "volume_fp": "10.00",
+        "open_time": "2024-01-01T00:00:00Z",
+        "close_time": "2024-02-01T00:00:00Z",
+    }
+
+
+def test_fetch_all_markets_streams_pages_to_slim_df(monkeypatch):
+    # Returns a converted DataFrame, not raw dicts: Kalshi's full catalog of
+    # raw market dicts hit ~9 GB RSS and never finished on the 8 GB machine.
+    monkeypatch.setattr(kalshi.time, "sleep", lambda s: None)
+    pages = {
+        None: {"markets": [_api_market("AAA-1"), _api_market("AAA-2")],
+               "cursor": "next1"},
+        "next1": {"markets": [_api_market("BBB-1")], "cursor": "next2"},
+        "next2": {"markets": [], "cursor": ""},  # empty final page
+    }
+    calls = []
+
+    def handler(request):
+        cursor = request.url.params.get("cursor")
+        calls.append(dict(request.url.params))
+        return httpx.Response(200, json=pages[cursor or None])
+
+    df = kalshi.fetch_all_markets(_mock_client(handler))
+    assert isinstance(df, pd.DataFrame)
+    assert list(df["market_id"]) == ["ka_AAA-1", "ka_AAA-2", "ka_BBB-1"]
+    assert "cursor" not in calls[0]
+    assert calls[1]["cursor"] == "next1"
+
+
+def test_history_todo_skips_done_and_provably_ineligible():
+    from uindex import config
+    floor = config.KALSHI_MIN_ROLLING_NOTIONAL_USD
+    # total_volume_usd is volume_fp * $0.50; true notional <= volume_fp * $1.00
+    # = total_volume_usd * 2, so markets with total_volume_usd * 2 < floor can
+    # never pass the rolling-notional universe filter.
+    meta = pd.DataFrame({
+        "market_id": ["ka_A", "ka_B", "ka_C"],
+        "total_volume_usd": [floor / 2, floor / 2 - 0.01, floor],
+    })
+    todo = kalshi.history_todo(meta, done={"ka_C"})
+    assert list(todo["market_id"]) == ["ka_A"]
+
+
 def test_candles_to_df_prob_and_notional():
     payload = json.loads((FIXTURES / "kalshi_candles.json").read_text())
     df = kalshi.candles_to_df(payload, market_id="ka_TEST")

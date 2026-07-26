@@ -6,9 +6,15 @@ import httpx
 import pandas as pd
 
 from .. import config
+from .store import PriceStore
 
 BASE = "https://api.elections.kalshi.com/trade-api/v2"
 OUT_DIR = config.DATA_DIR / "raw" / "kalshi"
+
+MARKETS_COLUMNS = [
+    "market_id", "venue", "question", "venue_category", "event_ticker",
+    "ticker", "series_ticker", "total_volume_usd", "open_date", "close_date",
+]
 
 
 def markets_to_df(markets: list[dict]) -> pd.DataFrame:
@@ -60,10 +66,13 @@ def candles_to_df(payload: dict, market_id: str) -> pd.DataFrame:
     return df.drop_duplicates(subset="date", keep="last")
 
 
-def fetch_all_markets(client: httpx.Client) -> list[dict]:
+def fetch_all_markets(client: httpx.Client) -> pd.DataFrame:
+    # Each page is converted to a slim DataFrame immediately: accumulating
+    # raw dicts for the full catalog (every strike variant since 2024) hit
+    # ~9 GB RSS and never finished on an 8 GB machine.
     min_close = int(datetime.fromisoformat(config.BACKFILL_START)
                     .replace(tzinfo=timezone.utc).timestamp())
-    out, cursor = [], None
+    frames, cursor, n = [], None, 0
     while True:
         params = {"limit": config.KALSHI_PAGE_SIZE, "min_close_ts": min_close}
         if cursor:
@@ -71,11 +80,33 @@ def fetch_all_markets(client: httpx.Client) -> list[dict]:
         r = client.get(f"{BASE}/markets", params=params)
         r.raise_for_status()
         j = r.json()
-        out.extend(j.get("markets", []))
+        batch = j.get("markets", [])
+        if batch:
+            frames.append(markets_to_df(batch))
+            n += len(batch)
+            if len(frames) % 50 == 0:
+                print(f"  metadata: {n} markets fetched", flush=True)
         cursor = j.get("cursor")
         if not cursor:
-            return out
+            break
         time.sleep(config.KALSHI_SLEEP_S)
+    if not frames:
+        return pd.DataFrame(columns=MARKETS_COLUMNS)
+    return pd.concat(frames, ignore_index=True)
+
+
+def history_todo(meta: pd.DataFrame, done: set[str]) -> pd.DataFrame:
+    # total_volume_usd is volume_fp x $0.50; true lifetime notional is at most
+    # volume_fp x $1.00 = total_volume_usd * 2, so below the rolling floor
+    # these markets can provably never pass the universe filter - skipping
+    # their candle fetch is lossless. The bound holds relative to the metadata
+    # snapshot: a still-open market would need ~ROLLING_WINDOW_DAYS x floor of
+    # post-snapshot notional to sneak past it, which the deliberate slack in
+    # the bound (vs the provable window-sum limit) absorbs.
+    return meta[
+        ~meta["market_id"].isin(done)
+        & (meta["total_volume_usd"] * 2 >= config.KALSHI_MIN_ROLLING_NOTIONAL_USD)
+    ]
 
 
 def fetch_candles(client: httpx.Client, series: str, ticker: str,
@@ -127,32 +158,26 @@ def main() -> None:
     if markets_path.exists():
         meta = pd.read_parquet(markets_path)
     else:
-        meta = markets_to_df(fetch_all_markets(client))
+        meta = fetch_all_markets(client)
         meta.to_parquet(markets_path, index=False)
     print(f"{len(meta)} kalshi markets")
 
-    prices_path = OUT_DIR / "prices.parquet"
-    done: set[str] = set()
-    frames: list[pd.DataFrame] = []
-    if prices_path.exists():
-        existing = pd.read_parquet(prices_path)
-        done = set(existing["market_id"].unique())
-        frames = [existing]
-
-    todo = meta[~meta["market_id"].isin(done)]
+    store = PriceStore(OUT_DIR)
+    todo = history_todo(meta, store.done_ids())
+    print(f"{len(todo)} markets to fetch after notional pre-filter")
     for i, row in enumerate(todo.itertuples(index=False)):
         start = int(row.open_date.replace(tzinfo=timezone.utc).timestamp())
         end = int(row.close_date.replace(tzinfo=timezone.utc).timestamp())
         try:
             payload = fetch_candles(client, row.series_ticker, row.ticker, start, end)
-            frames.append(candles_to_df(payload, row.market_id))
+            store.append(candles_to_df(payload, row.market_id))
         except httpx.HTTPStatusError as e:
             print(f"skip {row.market_id}: {e.response.status_code}")
         time.sleep(config.KALSHI_SLEEP_S)
         if i % 200 == 199:
-            pd.concat(frames, ignore_index=True).to_parquet(prices_path, index=False)
+            store.checkpoint()
             print(f"checkpoint: {i + 1}/{len(todo)}")
-    pd.concat(frames, ignore_index=True).to_parquet(prices_path, index=False)
+    store.finalize()
     print("kalshi ingestion complete")
 
 
