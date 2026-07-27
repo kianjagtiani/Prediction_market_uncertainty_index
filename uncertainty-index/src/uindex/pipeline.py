@@ -26,7 +26,10 @@ def _index_series(sub: pd.DataFrame, ewma_halflife: float) -> pd.DataFrame:
             "date": date,
             "turbulence": compute.weighted_mean(vols.loc[date], w),
             "unresolvedness": compute.weighted_mean(entropy.loc[date], w),
-            "n_constituents": int(probs.loc[date].notna().sum()),
+            # weight-bearing members only: a priced market with no usable
+            # weight contributes nothing to either gauge (compute.weighted_mean)
+            "n_constituents": int((probs.loc[date].notna()
+                                   & w.notna() & (w > 0)).sum()),
         })
     return pd.DataFrame(rows).set_index("date")
 

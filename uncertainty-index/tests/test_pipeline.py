@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from uindex import pipeline
+from uindex import pipeline, universe
 
 
 def _synthetic_flagged_panel(shock_day="2024-09-01"):
@@ -65,3 +65,48 @@ def test_reproducibility_byte_identical():
     a = pipeline.compute_indices(panel, params={"seed_days": 30})
     b = pipeline.compute_indices(panel, params={"seed_days": 30})
     pd.testing.assert_frame_equal(a, b)
+
+
+def test_n_constituents_counts_weight_bearing_only():
+    panel = _synthetic_flagged_panel()
+    panel.loc[panel["market_id"] == "m0", "weight"] = np.nan
+    pipeline.compute_indices(panel, params={"seed_days": 30})
+    counts = pipeline.compute_indices.constituents
+    econ = counts[counts["index"] == "ECON_FED"]["n_constituents"]
+    assert (econ == 7).all()  # 8 priced, 1 carries no weight
+
+
+def test_terminal_pin_collapse_never_reaches_the_index():
+    """The M10 guard must drop the settlement jump, not just the pinned tail."""
+    rng = np.random.default_rng(7)
+    dates = pd.date_range("2024-06-01", periods=120, freq="D")
+    collapse = pd.Timestamp("2024-08-01")
+    rows, prices = [], []
+    for i in range(6):
+        probs = 1 / (1 + np.exp(-np.cumsum(rng.normal(0, 0.05, 120))))
+        rows.append((f"m{i}", np.clip(probs, 0.05, 0.95)))
+    rows.append(("collapser", np.where(dates < collapse, 0.4, 0.995)))
+    meta = pd.DataFrame({
+        "market_id": [mid for mid, _ in rows],
+        "venue": "polymarket",
+        "question": [f"Q{mid}?" for mid, _ in rows],
+        "category": "ECON_FED",
+        "event_ticker": np.nan,
+        "total_volume_usd": 200000.0,
+        "open_date": pd.Timestamp("2024-05-01"),
+        "close_date": pd.Timestamp("2025-01-01"),
+    })
+    for mid, p in rows:
+        prices.append(pd.DataFrame({"market_id": mid, "date": dates,
+                                    "close_prob": p,
+                                    "daily_notional_usd": np.nan}))
+    panel = pd.concat(prices, ignore_index=True)
+    truncated = panel[~((panel["market_id"] == "collapser") &
+                        (panel["date"] >= collapse))]
+
+    full = pipeline.compute_indices(universe.apply_pit_rules(meta, panel),
+                                    params={"seed_days": 30})
+    cut = pipeline.compute_indices(universe.apply_pit_rules(meta, truncated),
+                                   params={"seed_days": 30})
+    merged = full.merge(cut, on=["date", "index", "gauge"], suffixes=("_f", "_c"))
+    assert np.allclose(merged["raw_f"], merged["raw_c"], equal_nan=True)
