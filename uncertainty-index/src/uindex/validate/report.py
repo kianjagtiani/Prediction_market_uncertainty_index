@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from .. import config
-from . import events
+from . import benchmarks, events
 
 OUT = config.PROJECT_ROOT / "docs" / "validation"
 
@@ -59,9 +59,9 @@ def main() -> None:
         "## Benchmark comparison", "",
     ]
     for name, r in bench.items():
-        best = max(r["leadlag"], key=lambda k: r["leadlag"][k])
         lines.append(f"- **{name}**: level corr {r['level_corr']:.2f}, "
-                     f"diff corr {r['diff_corr']:.2f}, best lag {best} "
+                     f"diff corr {r['diff_corr']:.2f}, "
+                     f"best lag {benchmarks.best_lag(r['leadlag']):+d} "
                      f"(negative = we lead). ![chart](benchmark_{name.lower()}.png)")
     lines += ["", "## Robustness", ""]
     if robust is not None:

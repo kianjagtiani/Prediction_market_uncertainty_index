@@ -37,6 +37,12 @@ def corr_and_leadlag(joined: pd.DataFrame, max_lag: int = 10) -> dict:
     }
 
 
+def best_lag(leadlag: dict) -> int:
+    """Highest-correlation lag; keys may arrive as JSON strings."""
+    return max(((int(k), v) for k, v in leadlag.items()),
+               key=lambda kv: kv[1])[0]
+
+
 def _download() -> dict[str, pd.Series]:
     BENCH_DIR.mkdir(parents=True, exist_ok=True)
     client = httpx.Client(timeout=60, follow_redirects=True)
@@ -65,6 +71,7 @@ def _download() -> dict[str, pd.Series]:
     gpr = pd.read_excel(raw)
     gpr.columns = [c.lower() for c in gpr.columns]
     out["GPR"] = gpr.assign(date=pd.to_datetime(gpr["date"])).set_index("date")["gprd"]
+    client.close()
     return out
 
 
@@ -94,9 +101,8 @@ def main() -> None:
 
     (BENCH_DIR / "comparison.json").write_text(json.dumps(results, indent=2))
     for name, r in results.items():
-        best = max(r["leadlag"], key=r["leadlag"].get)
         print(f"{name}: level={r['level_corr']:.2f} diff={r['diff_corr']:.2f} "
-              f"best lag={best:+d} (negative = we lead)")
+              f"best lag={best_lag(r['leadlag']):+d} (negative = we lead)")
 
 
 if __name__ == "__main__":

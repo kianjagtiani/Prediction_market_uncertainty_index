@@ -9,24 +9,29 @@ part-file, never the dataset.
 """
 import json
 import os
+import time
 from pathlib import Path
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .. import config
 
-def _stream_merge(sources: list[Path], final_path: Path) -> None:
-    """Merge parquet files into final_path one file at a time, keeping the
-    first occurrence of each market_id. Callers order sources so the
-    authoritative copy comes first."""
+
+def _stream_merge(sources: list[Path], final_path: Path,
+                  key: list[str]) -> None:
+    """Merge parquet files into final_path one file at a time, deduping on
+    `key` within each file and keeping the first-seen file's copy of each
+    market_id across files. Callers order sources so the authoritative copy
+    comes first."""
     seen: set[str] = set()
     writer = None
     tmp = final_path.with_name(final_path.name + ".tmp")
     try:
         for path in sources:
             df = pd.read_parquet(path)
-            df = df[~df["market_id"].isin(seen)]
+            df = df[~df["market_id"].isin(seen)].drop_duplicates(key)
             if df.empty:
                 continue
             seen.update(df["market_id"].unique())
@@ -43,11 +48,15 @@ def _stream_merge(sources: list[Path], final_path: Path) -> None:
         os.replace(tmp, final_path)
 
 
-def _next_part(parts_dir: Path) -> Path:
+def _write_part(df: pd.DataFrame, parts_dir: Path) -> None:
+    # tmp + replace: a kill mid-write must not leave a truncated parquet at
+    # a claimed part number, or every later portion crashes reading it.
     parts_dir.mkdir(parents=True, exist_ok=True)
     taken = [int(p.stem.split("-")[1]) for p in parts_dir.glob("part-*.parquet")]
-    n = max(taken, default=-1) + 1  # gaps must not cause overwrites
-    return parts_dir / f"part-{n:05d}.parquet"
+    part = parts_dir / f"part-{max(taken, default=-1) + 1:05d}.parquet"
+    tmp = part.with_name(part.name + ".tmp")
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, part)
 
 
 class MetaStore:
@@ -72,7 +81,7 @@ class MetaStore:
 
     def commit(self, df: pd.DataFrame, cursor: str | None, n_seen: int) -> None:
         if not df.empty:
-            df.to_parquet(_next_part(self.parts_dir), index=False)
+            _write_part(df, self.parts_dir)
         tmp = self.state_path.with_name(self.state_path.name + ".tmp")
         tmp.write_text(json.dumps({"cursor": cursor, "n_seen": n_seen}))
         os.replace(tmp, self.state_path)
@@ -80,14 +89,49 @@ class MetaStore:
     def finalize(self, columns: list[str]) -> None:
         parts = sorted(self.parts_dir.glob("part-*.parquet")) \
             if self.parts_dir.exists() else []
-        _stream_merge(parts, self.final_path)
+        _stream_merge(parts, self.final_path, ["market_id"])
         if not self.final_path.exists():  # catalog had no keepable rows
             pd.DataFrame(columns=columns).to_parquet(self.final_path, index=False)
+        # State goes first: if a crash strands the cleanup, a stale cursor
+        # must not survive to mislead a future re-crawl.
+        self.state_path.unlink(missing_ok=True)
         for p in parts:
             p.unlink()
         if self.parts_dir.exists():
             self.parts_dir.rmdir()
-        self.state_path.unlink(missing_ok=True)
+
+
+def crawl(store: MetaStore, fetch_page, columns: list[str], sleep_s: float,
+          max_pages: int | None = None) -> bool:
+    """Advance a metadata crawl by up to max_pages; True once exhausted.
+
+    fetch_page(cursor) -> (kept_df, n_raw, next_cursor). Pages stream to
+    shards every INGEST_FLUSH_PAGES so RAM never holds the catalog.
+    """
+    def flush(frames):
+        return (pd.concat(frames, ignore_index=True) if frames
+                else pd.DataFrame(columns=columns))
+
+    cursor, n = store.resume()
+    frames: list[pd.DataFrame] = []
+    pages = 0
+    while max_pages is None or pages < max_pages:
+        df, n_raw, cursor = fetch_page(cursor)
+        if n_raw:
+            frames.append(df)
+            n += n_raw
+        pages += 1
+        done = not n_raw or not cursor
+        if done or pages % config.INGEST_FLUSH_PAGES == 0:
+            store.commit(flush(frames), cursor, n)
+            frames = []
+            print(f"  metadata: {n} markets seen", flush=True)
+        if done:
+            store.finalize(columns)
+            return True
+        time.sleep(sleep_s)
+    store.commit(flush(frames), cursor, n)
+    return False
 
 
 class PriceStore:
@@ -126,8 +170,7 @@ class PriceStore:
     def checkpoint(self) -> None:
         if not self._buffer:
             return
-        pd.concat(self._buffer, ignore_index=True).to_parquet(
-            _next_part(self.parts_dir), index=False)
+        _write_part(pd.concat(self._buffer, ignore_index=True), self.parts_dir)
         self._buffer = []
 
     def finalize(self) -> None:
@@ -136,10 +179,11 @@ class PriceStore:
         if parts:
             # Parts before legacy: after a crash between the merge write and
             # the part unlinks, the parts are the authoritative copy. A
-            # market's rows always live in exactly one source file, so
-            # first-occurrence dedup by market_id is exact.
+            # market's rows always live in exactly one source file (fetches
+            # are always full-history per market), so first-occurrence dedup
+            # by market_id is exact.
             legacy = [self.final_path] if self.final_path.exists() else []
-            _stream_merge(parts + legacy, self.final_path)
+            _stream_merge(parts + legacy, self.final_path, ["market_id", "date"])
             for p in parts:
                 p.unlink()
             self.parts_dir.rmdir()

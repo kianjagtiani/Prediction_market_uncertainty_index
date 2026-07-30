@@ -114,7 +114,7 @@ def apply_pit_rules(meta: pd.DataFrame, panel: pd.DataFrame,
     pinned = df.groupby("market_id")["close_prob"].transform(
         _terminal_pin, p["pin_lo"], p["pin_hi"]
     )
-    eligible &= ~pinned.fillna(False).astype(bool)
+    eligible &= ~pinned
 
     # 3. Liquidity floors + weights
     is_pm = df["venue"] == "polymarket"

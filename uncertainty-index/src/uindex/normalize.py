@@ -9,8 +9,9 @@ META_COLS = ["market_id", "venue", "question", "category", "event_ticker",
 
 
 def categorize(question: str, venue_category: str) -> str:
-    text = (question or "").lower()
-    vcat = (venue_category or "").strip().lower()
+    # isinstance, not truthiness: parquet round-trips deliver NaN floats.
+    text = question.lower() if isinstance(question, str) else ""
+    vcat = venue_category.strip().lower() if isinstance(venue_category, str) else ""
     if vcat in config.SPORTS_VENUE_CATEGORIES or any(
             k in text for k in config.SPORTS_KEYWORDS):
         return "SPORTS"

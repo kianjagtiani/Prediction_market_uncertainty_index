@@ -133,6 +133,22 @@ def test_metastore_finalize_dedups_replayed_pages(tmp_path):
     assert not (tmp_path / "markets_cursor.json").exists()
 
 
+def test_crawl_flushes_intermediate_shards(monkeypatch, tmp_path):
+    # The crash-resume property lives in the intermediate flushes: a
+    # regression to end-only commit would still pass the end-to-end tests.
+    from uindex import config
+    from uindex.ingest.store import crawl
+    monkeypatch.setattr(config, "INGEST_FLUSH_PAGES", 1)
+    pages = {None: (_meta("pm_1"), 1, "c2"), "c2": (_meta("pm_2"), 1, None)}
+
+    store = MetaStore(tmp_path)
+    done = crawl(store, lambda cur: pages[cur], list(_meta("x").columns),
+                 sleep_s=0, max_pages=1)
+    assert done is False
+    assert len(list((tmp_path / "markets_parts").glob("part-*.parquet"))) == 1
+    assert MetaStore(tmp_path).resume()[0] == "c2"
+
+
 def test_metastore_finalize_empty_catalog_writes_empty_final(tmp_path):
     store = MetaStore(tmp_path)
     store.commit(_meta("x").iloc[:0], cursor=None, n_seen=0)

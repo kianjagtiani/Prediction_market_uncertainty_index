@@ -118,13 +118,13 @@ def test_crawl_markets_keep_filter_drops_dead_strikes(monkeypatch, tmp_path):
 
 def test_history_todo_skips_done_and_provably_ineligible():
     from uindex import config
-    floor = config.KALSHI_MIN_ROLLING_NOTIONAL_USD
-    # total_volume_usd is volume_fp * $0.50; true notional <= volume_fp * $1.00
-    # = total_volume_usd * 2, so markets with total_volume_usd * 2 < floor can
-    # never pass the rolling-notional universe filter.
+    # true notional <= total_volume_usd * 2; fetch extends to floor/slack so
+    # robustness sweeps that lower the floor never force a re-crawl.
+    slack = (config.KALSHI_MIN_ROLLING_NOTIONAL_USD
+             / config.METADATA_VOLUME_SLACK)
     meta = pd.DataFrame({
         "market_id": ["ka_A", "ka_B", "ka_C"],
-        "total_volume_usd": [floor / 2, floor / 2 - 0.01, floor],
+        "total_volume_usd": [slack / 2, slack / 2 - 0.01, slack],
     })
     todo = kalshi.history_todo(meta, done={"ka_C"})
     assert list(todo["market_id"]) == ["ka_A"]
@@ -134,7 +134,7 @@ def test_candles_to_df_prob_and_notional():
     payload = json.loads((FIXTURES / "kalshi_candles.json").read_text())
     df = kalshi.candles_to_df(payload, market_id="ka_TEST")
     assert list(df.columns) == ["market_id", "date", "close_prob", "daily_notional_usd"]
-    assert df["close_prob"].between(0, 1).all()  # cents converted
+    assert df["close_prob"].between(0, 1).all()  # already a 0-1 decimal
     assert (df["daily_notional_usd"] >= 0).all()
     assert not df["date"].duplicated().any()
 

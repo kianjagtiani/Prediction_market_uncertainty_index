@@ -4,6 +4,12 @@ import pandas as pd
 from . import compute, config, universe
 
 
+def _weighted_rows(vals: pd.DataFrame, w: pd.DataFrame) -> pd.Series:
+    """Row-wise weighted mean over weight-bearing members (NaN if none)."""
+    w = w.where(vals.notna() & w.notna() & (w > 0))
+    return (vals * w).sum(axis=1, min_count=1) / w.sum(axis=1, min_count=1)
+
+
 def _index_series(sub: pd.DataFrame, ewma_halflife: float) -> pd.DataFrame:
     """sub: eligible rows of one universe. Returns date-indexed raw gauges."""
     probs = sub.pivot_table(index="date", columns="market_id",
@@ -19,23 +25,20 @@ def _index_series(sub: pd.DataFrame, ewma_halflife: float) -> pd.DataFrame:
     entropy = pd.DataFrame(compute.binary_entropy(probs.values),
                            index=probs.index, columns=probs.columns)
 
-    rows = []
-    for date in probs.index:
-        w = weights.loc[date]
-        rows.append({
-            "date": date,
-            "turbulence": compute.weighted_mean(vols.loc[date], w),
-            "unresolvedness": compute.weighted_mean(entropy.loc[date], w),
-            # weight-bearing members only: a priced market with no usable
-            # weight contributes nothing to either gauge (compute.weighted_mean)
-            "n_constituents": int((probs.loc[date].notna()
-                                   & w.notna() & (w > 0)).sum()),
-        })
-    return pd.DataFrame(rows).set_index("date")
+    # weight-bearing members only: a priced market with no usable weight
+    # contributes nothing to either gauge.
+    return pd.DataFrame({
+        "turbulence": _weighted_rows(vols, weights),
+        "unresolvedness": _weighted_rows(entropy, weights),
+        "n_constituents": (probs.notna() & weights.notna()
+                           & (weights > 0)).sum(axis=1),
+    })
 
 
 def compute_indices(flagged_panel: pd.DataFrame,
-                    params: dict | None = None) -> pd.DataFrame:
+                    params: dict | None = None
+                    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Returns (indices, constituents) as tidy frames."""
     p = {"ewma_halflife": config.EWMA_HALFLIFE_DAYS,
          "seed_days": config.SEED_DAYS, **(params or {})}
     eligible = flagged_panel[flagged_panel["eligible"]]
@@ -58,10 +61,11 @@ def compute_indices(flagged_panel: pd.DataFrame,
             "n_constituents": series["n_constituents"].values,
         }))
 
+    if not tidy:
+        raise ValueError("no eligible rows in any universe")
     out = pd.concat(tidy, ignore_index=True).sort_values(
         ["index", "gauge", "date"]).reset_index(drop=True)
-    compute_indices.constituents = pd.concat(members, ignore_index=True)
-    return out
+    return out, pd.concat(members, ignore_index=True)
 
 
 def main() -> None:
@@ -71,17 +75,17 @@ def main() -> None:
 
     meta = pd.read_parquet(norm / "meta.parquet")
     panel = pd.read_parquet(norm / "panel.parquet")
-    flagged = universe.apply_pit_rules(meta, panel)
-    indices = compute_indices(flagged)
+    indices, constituents = compute_indices(universe.apply_pit_rules(meta, panel))
 
     indices.to_parquet(out_dir / "indices.parquet", index=False)
-    compute_indices.constituents.to_parquet(out_dir / "constituents.parquet",
-                                            index=False)
+    constituents.to_parquet(out_dir / "constituents.parquet", index=False)
     for name in config.INDEXES:
         sub = indices[(indices["index"] == name) &
                       (indices["gauge"] == "turbulence")]["value"].dropna()
-        print(f"{name:10s} turbulence: {len(sub)} days, "
-              f"last={sub.iloc[-1]:.0f}" if len(sub) else f"{name:10s} EMPTY")
+        if len(sub):
+            print(f"{name:10s} turbulence: {len(sub)} days, last={sub.iloc[-1]:.0f}")
+        else:
+            print(f"{name:10s} EMPTY")
 
 
 if __name__ == "__main__":

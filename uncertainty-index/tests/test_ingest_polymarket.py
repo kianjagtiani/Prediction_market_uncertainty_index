@@ -1,10 +1,12 @@
 import json
 from pathlib import Path
 
+import httpx
 import pandas as pd
+import pytest
 
 from uindex.ingest import polymarket as pm
-from uindex.ingest.store import MetaStore
+from uindex.ingest.store import MetaStore, PriceStore
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -125,17 +127,76 @@ def test_crawl_markets_keep_filter_drops_dead_markets(monkeypatch, tmp_path):
     assert list(df["market_id"]) == ["pm_2"]
 
 
-def test_history_todo_skips_done_and_below_volume_floor():
+def test_history_todo_skips_done_and_below_slack_floor():
     from uindex import config
-    floor = config.POLYMARKET_MIN_TOTAL_VOLUME_USD
+    # Fetch extends to floor/slack so robustness sweeps that lower the
+    # floor never force a re-crawl; only provably-never-eligible skipped.
+    slack = config.POLYMARKET_MIN_TOTAL_VOLUME_USD / config.METADATA_VOLUME_SLACK
     meta = pd.DataFrame({
         "market_id": ["pm_1", "pm_2", "pm_3"],
-        # At-floor markets survive the universe filter (< floor excludes),
-        # so they must still get history fetched.
-        "total_volume_usd": [floor, floor - 1, floor * 10],
+        "total_volume_usd": [slack, slack - 1, slack * 10],
     })
     todo = pm.history_todo(meta, done={"pm_3"})
     assert list(todo["market_id"]) == ["pm_1"]
+
+
+def test_history_to_df_float_dtype_for_integral_history():
+    # Resolved markets return JSON 0/1 ints; an int64 shard would wedge the
+    # schema-locked stream merge.
+    payload = {"history": [{"t": 1704067200, "p": 1}, {"t": 1704153600, "p": 0}]}
+    df = pm.history_to_df(payload, market_id="pm_1")
+    assert df["close_prob"].dtype == "float64"
+
+
+def _portion_env(monkeypatch, tmp_path, statuses):
+    """Wire main() to tmp dirs with scripted per-market HTTP outcomes."""
+    monkeypatch.setattr(pm, "OUT_DIR", tmp_path)
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    pd.DataFrame({
+        "market_id": [f"pm_{i}" for i in range(len(statuses))],
+        "venue": "polymarket", "question": "q", "venue_category": "",
+        "yes_token_id": [str(i) for i in range(len(statuses))],
+        "total_volume_usd": 100_000.0,
+        "open_date": pd.Timestamp("2024-01-01"),
+        "close_date": pd.Timestamp("2024-06-01"),
+    }).to_parquet(tmp_path / "markets.parquet", index=False)
+
+    def fetch(client, token_id):
+        status = statuses[int(token_id)]
+        if status == 200:
+            return {"history": [{"t": 1704067200, "p": 0.4}]}
+        if status == "empty":
+            return {"history": []}
+        req = httpx.Request("GET", pm.HISTORY_URL)
+        raise httpx.HTTPStatusError(
+            "err", request=req, response=httpx.Response(status, request=req))
+
+    monkeypatch.setattr(pm, "fetch_history", fetch)
+
+
+def test_main_tombstones_404_and_empty_but_not_transient(monkeypatch, tmp_path):
+    _portion_env(monkeypatch, tmp_path, {0: 200, 1: 404, 2: "empty"})
+    assert pm.main() is True
+    assert PriceStore(tmp_path).done_ids() == {"pm_0", "pm_1", "pm_2"}
+    ledger = set((tmp_path / "no_data_ids.txt").read_text().split())
+    assert ledger == {"pm_1", "pm_2"}  # 404 and no-data are permanent
+
+
+def test_main_raises_on_transient_http_error(monkeypatch, tmp_path):
+    # 429/5xx must crash the portion for retry, never tombstone the market.
+    _portion_env(monkeypatch, tmp_path, {0: 429})
+    with pytest.raises(httpx.HTTPStatusError):
+        pm.main()
+    assert not (tmp_path / "no_data_ids.txt").exists()
+
+
+def test_main_portions_and_finalizes_on_last(monkeypatch, tmp_path):
+    _portion_env(monkeypatch, tmp_path, {0: 200, 1: 200, 2: 200})
+    assert pm.main(markets=2) is False
+    assert pm.main(markets=2) is True  # drains the last market, finalizes
+    final = pd.read_parquet(tmp_path / "prices.parquet")
+    assert set(final["market_id"]) == {"pm_0", "pm_1", "pm_2"}
+    assert not (tmp_path / "prices_parts").exists()
 
 
 def test_history_to_df_daily_close():
