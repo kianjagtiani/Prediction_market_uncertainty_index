@@ -84,8 +84,11 @@ def test_empty_universe_raises_clearly():
         pipeline.compute_indices(panel, params={"seed_days": 30})
 
 
-def test_terminal_pin_collapse_never_reaches_the_index():
-    """The M10 guard must drop the settlement jump, not just the pinned tail."""
+def test_causal_pin_truncation_invariance_and_flatline_exit():
+    """Causal contract: the index never depends on data after t, so full and
+    truncated histories agree on every day before the truncation; the
+    collapse day itself enters (genuine repricing) and the settled flatline
+    drops out once PIN_CONSECUTIVE_DAYS pinned closes have been observed."""
     rng = np.random.default_rng(7)
     dates = pd.date_range("2024-06-01", periods=120, freq="D")
     collapse = pd.Timestamp("2024-08-01")
@@ -100,21 +103,27 @@ def test_terminal_pin_collapse_never_reaches_the_index():
         "question": [f"Q{mid}?" for mid, _ in rows],
         "category": "ECON_FED",
         "event_ticker": np.nan,
-        "total_volume_usd": 200000.0,
         "open_date": pd.Timestamp("2024-05-01"),
         "close_date": pd.Timestamp("2025-01-01"),
     })
     for mid, p in rows:
         prices.append(pd.DataFrame({"market_id": mid, "date": dates,
                                     "close_prob": p,
-                                    "daily_notional_usd": np.nan}))
+                                    "daily_notional_usd": 10000.0}))
     panel = pd.concat(prices, ignore_index=True)
     truncated = panel[~((panel["market_id"] == "collapser") &
                         (panel["date"] >= collapse))]
 
-    full, _ = pipeline.compute_indices(universe.apply_pit_rules(meta, panel),
-                                       params={"seed_days": 30})
+    flagged = universe.apply_pit_rules(meta, panel)
+    coll = flagged[flagged["market_id"] == "collapser"]
+    first_out = collapse + pd.Timedelta(days=universe.config.PIN_CONSECUTIVE_DAYS - 1)
+    assert coll[(coll["date"] >= collapse)
+                & (coll["date"] < first_out)]["eligible"].all()
+    assert not coll[coll["date"] >= first_out]["eligible"].any()
+
+    full, _ = pipeline.compute_indices(flagged, params={"seed_days": 30})
     cut, _ = pipeline.compute_indices(universe.apply_pit_rules(meta, truncated),
                                       params={"seed_days": 30})
     merged = full.merge(cut, on=["date", "index", "gauge"], suffixes=("_f", "_c"))
-    assert np.allclose(merged["raw_f"], merged["raw_c"], equal_nan=True)
+    pre = merged[merged["date"] < collapse]
+    assert np.allclose(pre["raw_f"], pre["raw_c"], equal_nan=True)

@@ -12,17 +12,16 @@ def _meta_panel():
                      "CPI above 3%?", "CPI above 4%?"],
         "category": ["ECON_FED"] * 4,
         "event_ticker": [np.nan, np.nan, "CPI-24", "CPI-24"],
-        "total_volume_usd": [200000.0, 100.0, 50000.0, 9000.0],
         "open_date": pd.to_datetime(["2024-01-01"] * 4),
         "close_date": pd.to_datetime(["2024-03-01"] * 4),
     })
+    notional = {"pm_a": 10000.0, "pm_small": 100.0,
+                "ka_s1": 1000.0, "ka_s2": 1000.0}
     dates = pd.date_range("2024-01-02", "2024-02-28", freq="D")
-    frames = []
-    for mid in meta["market_id"]:
-        frames.append(pd.DataFrame({
-            "market_id": mid, "date": dates, "close_prob": 0.5,
-            "daily_notional_usd": 1000.0 if mid.startswith("ka_") else np.nan,
-        }))
+    frames = [pd.DataFrame({
+        "market_id": mid, "date": dates, "close_prob": 0.5,
+        "daily_notional_usd": notional[mid],
+    }) for mid in meta["market_id"]]
     return meta, pd.concat(frames, ignore_index=True)
 
 
@@ -35,34 +34,79 @@ def test_resolution_exclusion_window():
     assert a[a["date"] == pd.Timestamp("2024-02-01")]["eligible"].all()
 
 
-def test_liquidity_floor_drops_small_polymarket():
+def test_rolling_floor_drops_small_polymarket():
     meta, panel = _meta_panel()
     out = universe.apply_pit_rules(meta, panel)
     assert not out[out["market_id"] == "pm_small"]["eligible"].any()
 
 
-def test_strike_group_keeps_only_most_liquid():
+def test_pm_nan_notional_is_ineligible():
+    # normalize's backward-compatible path leaves PM daily_notional_usd NaN
+    # until the volume sweep runs; NaN rolling must fail the floor.
     meta, panel = _meta_panel()
-    # Base fixture gives every Kalshi row a flat 1000/day notional, which
-    # never clears the 5000 rolling-notional floor (see
-    # test_kalshi_rolling_notional_floor) regardless of strike-group
-    # outcome. Raise ka_s1's notional so this test isolates the
-    # strike-group rule instead of being vacuously blocked by the floor.
-    panel.loc[panel["market_id"] == "ka_s1", "daily_notional_usd"] = 10000.0
+    panel.loc[panel["market_id"] == "pm_a", "daily_notional_usd"] = np.nan
     out = universe.apply_pit_rules(meta, panel)
-    assert out[out["market_id"] == "ka_s1"]["eligible"].any()   # 50k volume
-    assert not out[out["market_id"] == "ka_s2"]["eligible"].any()  # 9k, same event
+    assert not out[out["market_id"] == "pm_a"]["eligible"].any()
 
 
-def test_kalshi_rolling_notional_floor():
+def test_rolling_floor_same_rule_both_venues():
     meta, panel = _meta_panel()
     # 1000/day * 7d rolling mean = 1000 < 5000 floor -> ineligible
     out = universe.apply_pit_rules(meta, panel)
     assert not out[out["market_id"] == "ka_s1"]["eligible"].iloc[10:].any()
-    # raise notional -> eligible after rolling window fills
+    # raise notional -> eligible once the rolling window fills
     panel.loc[panel["market_id"] == "ka_s1", "daily_notional_usd"] = 10000.0
     out2 = universe.apply_pit_rules(meta, panel)
-    assert out2[out2["market_id"] == "ka_s1"]["eligible"].iloc[10:-3].all()
+    ka = out2[out2["market_id"] == "ka_s1"]
+    assert not ka["eligible"].iloc[:6].any()  # min_periods = window
+    assert ka["eligible"].iloc[10:-3].all()
+
+
+def test_strike_group_keeps_only_deepest():
+    meta, panel = _meta_panel()
+    # Both strikes clear the floor so this isolates the per-day rep rule.
+    panel.loc[panel["market_id"] == "ka_s1", "daily_notional_usd"] = 10000.0
+    panel.loc[panel["market_id"] == "ka_s2", "daily_notional_usd"] = 6000.0
+    out = universe.apply_pit_rules(meta, panel)
+    assert out[out["market_id"] == "ka_s1"]["eligible"].any()
+    assert not out[out["market_id"] == "ka_s2"]["eligible"].any()
+
+
+def test_strike_rep_migrates_with_liquidity():
+    meta, panel = _meta_panel()
+    switch = panel["date"] >= pd.Timestamp("2024-02-01")
+    s1 = panel["market_id"] == "ka_s1"
+    s2 = panel["market_id"] == "ka_s2"
+    panel.loc[s1, "daily_notional_usd"] = np.where(switch[s1], 6000.0, 10000.0)
+    panel.loc[s2, "daily_notional_usd"] = np.where(switch[s2], 10000.0, 6000.0)
+    out = universe.apply_pit_rules(meta, panel)
+
+    def rep_on(day):
+        rows = out[(out["date"] == pd.Timestamp(day)) & out["eligible"]
+                   & out["market_id"].str.startswith("ka_")]
+        return rows["market_id"].tolist()
+
+    assert rep_on("2024-01-20") == ["ka_s1"]
+    assert rep_on("2024-02-15") == ["ka_s2"]  # rolling has fully migrated
+    # exactly one eligible strike per event per day once the window fills
+    ka_days = out[out["eligible"] & out["market_id"].str.startswith("ka_")]
+    assert (ka_days.groupby("date").size() == 1).all()
+
+
+def test_strike_tie_break_is_row_order_independent():
+    meta, panel = _meta_panel()
+    panel.loc[panel["market_id"].str.startswith("ka_"),
+              "daily_notional_usd"] = 10000.0
+    forward = universe.apply_pit_rules(meta, panel)
+    reversed_ = universe.apply_pit_rules(meta.iloc[::-1].reset_index(drop=True),
+                                         panel)
+
+    def kept(out):
+        ka = out[out["eligible"] & out["market_id"].str.startswith("ka_")]
+        return set(ka["market_id"])
+
+    # lexicographically first of the tied strikes, either row order
+    assert kept(forward) == kept(reversed_) == {"ka_s1"}
 
 
 def test_manual_override_dedup(tmp_path):
@@ -79,7 +123,7 @@ def test_weights_positive_for_eligible():
     assert (out.loc[out["eligible"], "weight"] > 0).all()
 
 
-def _mixed_venue(volume=1_000_000.0, notional=20_000.0):
+def _mixed_venue(notional=20_000.0):
     """One eligible PM and one eligible Kalshi market of comparable size."""
     meta = pd.DataFrame({
         "market_id": ["pm_big", "ka_big"],
@@ -87,16 +131,14 @@ def _mixed_venue(volume=1_000_000.0, notional=20_000.0):
         "question": ["Will the Fed cut rates?", "CPI above 3%?"],
         "category": ["ECON_FED"] * 2,
         "event_ticker": [np.nan, "CPI-24"],
-        "total_volume_usd": [volume, volume],
         "open_date": pd.to_datetime(["2024-01-01"] * 2),
         "close_date": pd.to_datetime(["2024-03-01"] * 2),
     })
     dates = pd.date_range("2024-01-02", "2024-02-01", freq="D")
     panel = pd.concat([
-        pd.DataFrame({"market_id": "pm_big", "date": dates,
-                      "close_prob": 0.5, "daily_notional_usd": np.nan}),
-        pd.DataFrame({"market_id": "ka_big", "date": dates,
-                      "close_prob": 0.5, "daily_notional_usd": notional}),
+        pd.DataFrame({"market_id": mid, "date": dates, "close_prob": 0.5,
+                      "daily_notional_usd": notional})
+        for mid in meta["market_id"]
     ], ignore_index=True)
     return meta, panel
 
@@ -122,40 +164,49 @@ def _pin_panel():
         "question": ["Will X resolve early?", "Will Y wobble?"],
         "category": ["ECON_FED"] * 2,
         "event_ticker": [np.nan, np.nan],
-        "total_volume_usd": [200000.0, 200000.0],
         "open_date": pd.to_datetime(["2024-01-01"] * 2),
         "close_date": pd.to_datetime(["2024-06-01"] * 2),
     })
     panel = pd.concat([
         pd.DataFrame({"market_id": "pm_pin", "date": dates,
-                      "close_prob": pinned, "daily_notional_usd": np.nan}),
+                      "close_prob": pinned, "daily_notional_usd": 10000.0}),
         pd.DataFrame({"market_id": "pm_round", "date": dates,
-                      "close_prob": round_trip, "daily_notional_usd": np.nan}),
+                      "close_prob": round_trip, "daily_notional_usd": 10000.0}),
     ], ignore_index=True)
-    return meta, panel, collapse
+    # first day pinned exclusion can trigger: the pin_days-th pinned close
+    first_out = collapse + pd.Timedelta(days=universe.config.PIN_CONSECUTIVE_DAYS - 1)
+    return meta, panel, collapse, first_out
 
 
-def test_terminal_pin_excludes_early_resolution():
-    meta, panel, collapse = _pin_panel()
+def test_causal_pin_collapse_day_stays_flatline_leaves():
+    meta, panel, collapse, first_out = _pin_panel()
     out = universe.apply_pit_rules(meta, panel)
     pin = out[out["market_id"] == "pm_pin"]
-    assert pin[pin["date"] < collapse]["eligible"].all()
-    assert not pin[pin["date"] >= collapse]["eligible"].any()
+    assert pin[(pin["date"] >= collapse) & (pin["date"] < first_out)]["eligible"].all()
+    assert not pin[pin["date"] >= first_out]["eligible"].any()
 
 
-def test_terminal_pin_survives_a_gap_in_the_settled_tail():
-    meta, panel, collapse = _pin_panel()
-    tail = (panel["market_id"] == "pm_pin") & (panel["date"] > collapse)
-    panel.loc[panel.index[tail][3], "close_prob"] = np.nan
+def test_causal_pin_gap_does_not_reset_the_run():
+    meta, panel, collapse, first_out = _pin_panel()
+    gap = collapse + pd.Timedelta(days=2)
+    panel.loc[(panel["market_id"] == "pm_pin")
+              & (panel["date"] == gap), "close_prob"] = np.nan
     out = universe.apply_pit_rules(meta, panel)
     pin = out[out["market_id"] == "pm_pin"]
-    assert not pin[pin["date"] >= collapse]["eligible"].any()
+    # the gap day itself is ineligible (no price) but only shifts the run by
+    # one observation: the 5th pinned close now lands on first_out + 1 day
+    assert not pin[pin["date"] == gap]["eligible"].any()
+    assert pin[pin["date"] == first_out]["eligible"].all()
+    assert not pin[pin["date"] > first_out]["eligible"].any()
 
 
-def test_non_terminal_pin_stays_eligible():
-    meta, panel, _ = _pin_panel()
+def test_causal_pin_bounce_readmits():
+    meta, panel, collapse, first_out = _pin_panel()
+    back = pd.Timestamp("2024-02-01")
     out = universe.apply_pit_rules(meta, panel)
-    assert out[out["market_id"] == "pm_round"]["eligible"].all()
+    rnd = out[out["market_id"] == "pm_round"]
+    assert not rnd[(rnd["date"] >= first_out) & (rnd["date"] < back)]["eligible"].any()
+    assert rnd[rnd["date"] >= back]["eligible"].all()
 
 
 def _title_pair(venues, opens, closes):
@@ -165,7 +216,6 @@ def _title_pair(venues, opens, closes):
         "question": ["Will it rain in NYC?", "will it rain in NYC?"],
         "category": ["CLIMATE"] * 2,
         "event_ticker": [np.nan, np.nan],
-        "total_volume_usd": [200000.0, 300000.0],
         "open_date": pd.to_datetime(opens),
         "close_date": pd.to_datetime(closes),
     })
@@ -174,7 +224,7 @@ def _title_pair(venues, opens, closes):
         dates = pd.date_range(o, pd.Timestamp(c) - pd.Timedelta(days=5), freq="D")
         frames.append(pd.DataFrame({
             "market_id": mid, "date": dates, "close_prob": 0.5,
-            "daily_notional_usd": np.nan,
+            "daily_notional_usd": 10000.0,
         }))
     return meta, pd.concat(frames, ignore_index=True)
 
@@ -188,16 +238,29 @@ def test_same_venue_repeated_title_disjoint_windows_both_survive():
     assert out[out["market_id"] == "m_b"]["eligible"].any()
 
 
-def test_cross_venue_same_title_overlap_dedups(tmp_path):
+def test_cross_venue_same_title_overlap_dedups_keeps_earlier_open(tmp_path):
     meta, panel = _title_pair(["polymarket", "kalshi"],
                               ["2024-01-01", "2024-01-15"],
                               ["2024-02-01", "2024-02-15"])
     audit = tmp_path / "dedup_audit.csv"
     out = universe.apply_pit_rules(meta, panel, audit_path=audit)
-    assert not out[out["market_id"] == "m_a"]["eligible"].any()  # lower volume
+    assert not out[out["market_id"] == "m_b"]["eligible"].any()  # later open
+    assert out[out["market_id"] == "m_a"]["eligible"].any()
     rows = pd.read_csv(audit)
-    assert rows["drop_market_id"].tolist() == ["m_a"]
-    assert rows["keep_market_id"].tolist() == ["m_b"]
+    assert rows["drop_market_id"].tolist() == ["m_b"]
+    assert rows["keep_market_id"].tolist() == ["m_a"]
+
+
+def test_dedup_nat_open_date_loses(tmp_path):
+    meta, panel = _title_pair(["polymarket", "kalshi"],
+                              ["2024-01-01", "2024-01-15"],
+                              ["2024-02-01", "2024-02-15"])
+    meta.loc[meta["market_id"] == "m_a", "open_date"] = pd.NaT
+    audit = tmp_path / "dedup_audit.csv"
+    out = universe.apply_pit_rules(meta, panel, audit_path=audit)
+    assert not out[out["market_id"] == "m_a"]["eligible"].any()
+    assert out[out["market_id"] == "m_b"]["eligible"].any()
+    assert pd.read_csv(audit)["keep_market_id"].tolist() == ["m_b"]
 
 
 def test_missing_close_date_counted_and_reported(capsys):
@@ -222,19 +285,3 @@ def test_missing_open_date_does_not_exclude():
     meta.loc[meta["market_id"] == "pm_a", "open_date"] = pd.NaT
     out = universe.apply_pit_rules(meta, panel)
     assert out[out["market_id"] == "pm_a"]["eligible"].any()
-
-
-def test_strike_tie_break_is_row_order_independent():
-    meta, panel = _meta_panel()
-    meta.loc[meta["market_id"] == "ka_s2", "total_volume_usd"] = 50000.0
-    panel.loc[panel["market_id"].str.startswith("ka_"),
-              "daily_notional_usd"] = 10000.0
-    forward = universe.apply_pit_rules(meta, panel)
-    reversed_ = universe.apply_pit_rules(meta.iloc[::-1].reset_index(drop=True),
-                                         panel)
-    def kept(out):
-        ka = out[out["eligible"] & out["market_id"].str.startswith("ka_")]
-        return set(ka["market_id"])
-
-    # lexicographically first of the tied strikes, either row order
-    assert kept(forward) == kept(reversed_) == {"ka_s1"}

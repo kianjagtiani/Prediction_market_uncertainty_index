@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from .. import config
-from . import benchmarks, events
+from . import benchmarks, churn, events
 
 OUT = config.PROJECT_ROOT / "docs" / "validation"
 
@@ -29,8 +29,6 @@ def _index_chart(indices: pd.DataFrame) -> None:
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     indices = pd.read_parquet(config.DATA_DIR / "indices" / "indices.parquet")
-    constituents = pd.read_parquet(config.DATA_DIR / "indices" /
-                                   "constituents.parquet")
     _index_chart(indices)
 
     ev = events.check_events(indices)
@@ -39,19 +37,16 @@ def main() -> None:
                         "comparison.json").read_text())
     robust_path = config.DATA_DIR / "indices" / "robustness.csv"
     robust = pd.read_csv(robust_path) if robust_path.exists() else None
-
-    # churn audit: index moves must not track membership moves
-    glob = indices[(indices["index"] == "GLOBAL") &
-                   (indices["gauge"] == "turbulence")].set_index("date")["value"]
-    n = constituents[constituents["index"] == "GLOBAL"
-                     ].set_index("date")["n_constituents"]
-    churn_corr = float(glob.diff().corr(n.diff()))
+    churn_path = config.DATA_DIR / "indices" / "churn.csv"
+    churn_daily = pd.read_csv(churn_path) if churn_path.exists() else None
 
     lines = [
         "# Uncertainty Index — Phase 1 Validation Report", "",
         f"_Generated {pd.Timestamp.now():%Y-%m-%d}_", "",
         "![All indices](all_indices.png)", "",
-        "## Event study (pass = window max >= 90)", "",
+        "## Event study (pass = placebo p-value <= 0.10)", "",
+        "p-value = share of equal-length non-event windows whose max >= the "
+        "event window's max; `max_ge_90` is the legacy threshold check.", "",
         ev.to_markdown(index=False), "",
         "## Top 10 spike days (GLOBAL turbulence)",
         "", "Annotate each date with the driving news story before publishing:",
@@ -61,16 +56,25 @@ def main() -> None:
     for name, r in bench.items():
         lines.append(f"- **{name}**: level corr {r['level_corr']:.2f}, "
                      f"diff corr {r['diff_corr']:.2f}, "
-                     f"best lag {benchmarks.best_lag(r['leadlag']):+d} "
-                     f"(negative = we lead). ![chart](benchmark_{name.lower()}.png)")
+                     f"best lag {benchmarks.best_lag(r['leadlag']):+d}, "
+                     f"leads: {'yes' if r['leads'] else 'no'} "
+                     f"(noise band {r['noise_band']:.3f}; a lead is claimed "
+                     f"only if best-lag corr beats lag-0 by the band). "
+                     f"![chart](benchmark_{name.lower()}.png)")
     lines += ["", "## Robustness", ""]
     if robust is not None:
-        lines.append(f"Min pairwise correlation across param variants: "
-                     f"**{robust['corr'].min():.3f}** (target >= 0.90).")
-    lines += ["", "## Churn audit", "",
-              f"Corr(Δindex, Δconstituent-count) = **{churn_corr:.3f}** "
-              f"(want |value| small; large means membership churn, not news, "
-              f"moves the index)."]
+        lines += [f"Min pairwise correlation across param variants: "
+                  f"**{robust['min_pairwise_corr'].min():.3f}** "
+                  f"(target >= 0.90). Per-variant event-study passes:", "",
+                  robust.to_markdown(index=False)]
+    lines += ["", "## Churn audit", ""]
+    if churn_daily is not None:
+        share = churn.membership_share(churn_daily)
+        lines.append(f"Membership share of total |Δraw| (GLOBAL turbulence) = "
+                     f"**{share:.3f}** (guideline <= 0.20; large means "
+                     f"membership churn, not repricing, moves the index).")
+    else:
+        lines.append("churn.csv not found — run `python -m uindex.validate.churn`.")
 
     (OUT / "report.md").write_text("\n".join(lines))
     print(f"report written to {OUT / 'report.md'}")

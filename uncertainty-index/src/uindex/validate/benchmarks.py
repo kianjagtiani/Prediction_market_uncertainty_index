@@ -1,5 +1,6 @@
 """Compare GLOBAL turbulence to VIX, EPU, GPR: correlation + lead-lag."""
 import json
+import math
 
 import httpx
 import matplotlib
@@ -24,22 +25,38 @@ def align(index_series: pd.Series, bench: pd.Series) -> pd.DataFrame:
     return joined
 
 
-def corr_and_leadlag(joined: pd.DataFrame, max_lag: int = 10) -> dict:
-    diffs = joined.diff().dropna()
-    leadlag = {
-        lag: float(diffs["idx"].corr(diffs["bench"].shift(lag)))
-        for lag in range(-max_lag, max_lag + 1)
-    }
+def corr_and_leadlag(index_series: pd.Series, bench: pd.Series,
+                     max_lag: int = 10) -> dict:
+    """Diff each series on its OWN calendar before aligning, so gaps in the
+    benchmark calendar (weekends, holidays) cannot fold multi-day index moves
+    into one artificial shared observation."""
+    joined = align(index_series, bench)
+    d_idx = index_series.diff().dropna()
+    d_bench = bench.diff().dropna()
+
+    def _pair(lag: int) -> pd.DataFrame:
+        return pd.concat({"idx": d_idx, "bench": d_bench.shift(lag)},
+                         axis=1).dropna()
+
+    leadlag = {}
+    for lag in range(-max_lag, max_lag + 1):
+        pair = _pair(lag)
+        leadlag[lag] = float(pair["idx"].corr(pair["bench"]))
+    n_obs = len(_pair(0))
+    band = 2.0 / math.sqrt(n_obs) if n_obs else float("nan")
+    bl = best_lag(leadlag)
     return {
         "level_corr": float(joined["idx"].corr(joined["bench"])),
-        "diff_corr": float(diffs["idx"].corr(diffs["bench"])),
+        "diff_corr": leadlag[0],
         "leadlag": leadlag,
+        "noise_band": band,
+        "leads": bool(bl < 0 and leadlag[bl] - leadlag[0] > band),
     }
 
 
 def best_lag(leadlag: dict) -> int:
     """Highest-correlation lag; keys may arrive as JSON strings."""
-    return max(((int(k), v) for k, v in leadlag.items()),
+    return max(((int(k), v) for k, v in leadlag.items() if v == v),
                key=lambda kv: kv[1])[0]
 
 
@@ -85,7 +102,7 @@ def main() -> None:
     results = {}
     for name, bench in _download().items():
         joined = align(ours, bench)
-        results[name] = corr_and_leadlag(joined)
+        results[name] = corr_and_leadlag(ours, bench)
         fig, ax1 = plt.subplots(figsize=(11, 4.5))
         ax1.plot(joined.index, joined["idx"], label="Global Uncertainty (0-100)",
                  linewidth=2)
@@ -102,7 +119,10 @@ def main() -> None:
     (BENCH_DIR / "comparison.json").write_text(json.dumps(results, indent=2))
     for name, r in results.items():
         print(f"{name}: level={r['level_corr']:.2f} diff={r['diff_corr']:.2f} "
-              f"best lag={best_lag(r['leadlag']):+d} (negative = we lead)")
+              f"best lag={best_lag(r['leadlag']):+d} "
+              f"band={r['noise_band']:.3f} "
+              f"leads={'yes' if r['leads'] else 'no'} (negative lag = we lead; "
+              f"lead claimed only if it clears the noise band vs lag 0)")
 
 
 if __name__ == "__main__":

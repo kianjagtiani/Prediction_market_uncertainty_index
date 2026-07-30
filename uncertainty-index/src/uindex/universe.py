@@ -13,11 +13,12 @@ DEFAULT_DEDUP_AUDIT = config.DATA_DIR / "universe" / "dedup_audit.csv"
 def _default_params() -> dict:
     return {
         "resolution_exclusion_days": config.RESOLUTION_EXCLUSION_DAYS,
-        "pm_min_total_volume": config.POLYMARKET_MIN_TOTAL_VOLUME_USD,
+        "pm_min_rolling_notional": config.POLYMARKET_MIN_ROLLING_NOTIONAL_USD,
         "ka_min_rolling_notional": config.KALSHI_MIN_ROLLING_NOTIONAL_USD,
         "rolling_window_days": config.ROLLING_WINDOW_DAYS,
         "pin_lo": config.CLIP_LO,
         "pin_hi": config.CLIP_HI,
+        "pin_days": config.PIN_CONSECUTIVE_DAYS,
     }
 
 
@@ -25,16 +26,19 @@ def _normalized_question(q: str) -> str:
     return " ".join((q or "").lower().split())
 
 
-def _terminal_pin(prob: pd.Series, lo: float, hi: float) -> pd.Series:
-    """True over the maximal date-sorted suffix pinned at/outside [lo, hi].
+def _pinned_run(prob: pd.Series, lo: float, hi: float, days: int) -> pd.Series:
+    """True on day t iff the last `days` observed closes (t inclusive) all sit
+    at/outside [lo, hi]. Strictly causal: only closes up to t are read.
 
     Days with no price are skipped rather than treated as unpinned, so a gap
-    in the settled tail cannot reopen the run (those rows are ineligible for
-    lack of a price anyway).
+    inside a settled flatline cannot reset the run (those rows are ineligible
+    for lack of a price anyway). A fresh collapse has run length 1, so it
+    stays in until `days` pinned closes have been observed.
     """
     obs = prob.dropna()
-    pinned = ((obs >= hi) | (obs <= lo))[::-1].cummin()[::-1]
-    return pinned.reindex(prob.index, fill_value=False)
+    pinned = ((obs >= hi) | (obs <= lo)).astype(float)
+    run = pinned.rolling(days, min_periods=days).min().eq(1.0)
+    return run.reindex(prob.index, fill_value=False)
 
 
 def _windows_overlap(a: pd.Series, b: pd.Series) -> bool:
@@ -52,6 +56,8 @@ def _windows_overlap(a: pd.Series, b: pd.Series) -> bool:
 
 def _cross_venue_dups(meta: pd.DataFrame) -> list[dict]:
     """Exact-title duplicates listed on both venues over the same period.
+    Keeper = earliest open_date (NaT last, ties -> market_id): fixed at
+    listing time, so PIT-safe, unlike volume accumulated over the life.
 
     Same-venue title repeats are left alone: weather dailies and relisted
     questions reuse a title verbatim for genuinely different periods, and
@@ -63,8 +69,8 @@ def _cross_venue_dups(meta: pd.DataFrame) -> list[dict]:
         if group["venue"].nunique() < 2:
             continue
         kept = []
-        ordered = group.sort_values(["total_volume_usd", "market_id"],
-                                    ascending=[False, True])
+        ordered = group.sort_values(["open_date", "market_id"],
+                                    na_position="last")
         for _, row in ordered.iterrows():
             dup_of = next((k for k in kept if k["venue"] != row["venue"]
                            and _windows_overlap(k, row)), None)
@@ -86,7 +92,7 @@ def apply_pit_rules(meta: pd.DataFrame, panel: pd.DataFrame,
     p = {**_default_params(), **(params or {})}
     df = panel.merge(
         meta[["market_id", "venue", "category", "event_ticker",
-              "total_volume_usd", "open_date", "close_date", "question"]],
+              "open_date", "close_date", "question"]],
         on="market_id", how="left",
     ).sort_values(["market_id", "date"])
 
@@ -103,48 +109,44 @@ def apply_pit_rules(meta: pd.DataFrame, panel: pd.DataFrame,
         print(f"universe: {n_no_close} markets have no close_date and are "
               f"excluded for their entire life")
 
-    # 2. Early-resolution guard. A market that settles months before its
-    #    close_date collapses (e.g. 0.40 -> 0.995) and pins there; the
-    #    close_date-based cutoff above misses it entirely. Drop the terminal
-    #    pinned run, which includes the collapse day itself, so the settlement
-    #    jump never enters an eligible market's price path. Identifying the
-    #    run as *terminal* uses the rest of the path, a deliberate mild
-    #    look-ahead in the conservative direction: it only removes fake
-    #    spikes, it never adds signal.
+    # 2. Early-resolution guard, causal. A market that settles months before
+    #    its close_date collapses (e.g. 0.40 -> 0.995) and flatlines; the
+    #    close_date-based cutoff above misses it entirely. The collapse day
+    #    itself stays in (genuine repricing); once pin_days observed closes
+    #    have all been pinned the flatline leaves, and a bounce back inside
+    #    the band re-admits it. No future data is read.
     pinned = df.groupby("market_id")["close_prob"].transform(
-        _terminal_pin, p["pin_lo"], p["pin_hi"]
+        _pinned_run, p["pin_lo"], p["pin_hi"], p["pin_days"]
     )
     eligible &= ~pinned
 
-    # 3. Liquidity floors + weights
-    is_pm = df["venue"] == "polymarket"
-    eligible &= ~(is_pm & (df["total_volume_usd"] < p["pm_min_total_volume"]))
+    # 3. Liquidity floor + weight: trailing rolling mean of daily notional,
+    #    same rule for both venues. PM rows carry daily_notional_usd = NaN
+    #    when the Goldsky volume sweep hasn't run (normalize's backward-
+    #    compatible path); NaN rolling fails the >= floor comparison, so
+    #    those rows stay ineligible rather than silently passing.
     rolling = (
         df.groupby("market_id")["daily_notional_usd"]
         .transform(lambda s: s.rolling(p["rolling_window_days"],
                                        min_periods=p["rolling_window_days"]).mean())
     )
-    is_ka = df["venue"] == "kalshi"
-    eligible &= ~(is_ka & ~(rolling >= p["ka_min_rolling_notional"]))
-    # log1p on both venues. The two inputs are different quantities (PM
-    # lifetime USD vs Kalshi rolling daily notional) but a raw linear notional
-    # (>= 5,000) would outweigh any log1p PM weight (<= ~21) by ~10^3, making
-    # every mixed universe a pure-Kalshi index. Same functional form keeps the
-    # venues commensurable and damps whales identically.
-    df["weight"] = np.log1p(np.where(is_pm, df["total_volume_usd"], rolling))
+    floor = np.where(df["venue"] == "polymarket",
+                     p["pm_min_rolling_notional"], p["ka_min_rolling_notional"])
+    eligible &= rolling >= floor
+    # log1p damps whales identically on both venues.
+    df["weight"] = np.log1p(rolling)
 
-    # 4. Kalshi strike groups: lifetime-most-liquid strike represents the
-    #    event, ties broken on ticker so re-crawls are reproducible.
-    ka_meta = meta[meta["venue"] == "kalshi"].dropna(subset=["event_ticker"])
-    reps = (
-        ka_meta.sort_values(["total_volume_usd", "market_id"],
-                            ascending=[False, True])
-        .groupby("event_ticker")["market_id"].first()
-    )
-    non_reps = set(ka_meta["market_id"]) - set(reps)
-    eligible &= ~df["market_id"].isin(non_reps)
+    # 4. Kalshi strike groups: per day, the eligible strike with the deepest
+    #    trailing notional represents the event (ties -> market_id, so
+    #    re-crawls are reproducible); its siblings sit out that day.
+    ka = df["venue"].eq("kalshi") & df["event_ticker"].notna()
+    cand = df.loc[ka & eligible, ["event_ticker", "date", "market_id"]]
+    reps = (cand.assign(roll=rolling)
+            .sort_values(["roll", "market_id"], ascending=[False, True])
+            .drop_duplicates(["event_ticker", "date"]))
+    eligible &= ~ka | df.index.isin(reps.index)
 
-    # 5. Cross-venue exact-question dedup: keep the higher lifetime volume.
+    # 5. Cross-venue exact-question dedup: keep the earlier listing.
     dups = _cross_venue_dups(meta)
     if dups:
         Path(audit_path).parent.mkdir(parents=True, exist_ok=True)

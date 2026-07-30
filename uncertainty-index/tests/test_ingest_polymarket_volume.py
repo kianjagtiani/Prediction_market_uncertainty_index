@@ -1,0 +1,270 @@
+import json
+
+import pandas as pd
+import pytest
+
+from uindex import config, normalize
+from uindex.ingest import polymarket_volume as pv
+from uindex.ingest.polymarket_volume import TokenMapStore, VolumeStore
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def _fill(ts, fid, token, size):
+    return {"id": fid, "timestamp": str(ts), "size": str(size),
+            "market": {"id": token}}
+
+
+class _FakeGoldsky:
+    """Scripted GraphQL endpoint replicating the live-verified semantics:
+    orderBy timestamp with id tie-break, or-cursor continuation, and the
+    statement-timeout failure for pages above fail_above rows."""
+
+    def __init__(self, fills=(), market_datas=None, fail_above=None):
+        self.fills = sorted(fills, key=lambda f: (int(f["timestamp"]), f["id"]))
+        self.market_datas = market_datas or {}  # token -> condition
+        self.fail_above = fail_above
+        self.calls = []
+
+    def post(self, url, json):
+        assert url == config.GOLDSKY_URL
+        self.calls.append(json)
+        q, var = json["query"], json["variables"]
+        if "enrichedOrderFilleds" in q:
+            return self._fills_page(var)
+        if "id_in" in q:
+            rows = [{"id": t, "condition": {"id": self.market_datas[t]}}
+                    for t in var["ids"] if t in self.market_datas]
+            return _FakeResponse({"data": {"marketDatas": rows}})
+        if "condition_in" in q:
+            rows = [{"id": t, "condition": {"id": c}}
+                    for t, c in self.market_datas.items()
+                    if c in var["conds"]]
+            return _FakeResponse({"data": {"marketDatas": rows}})
+        raise AssertionError(f"unexpected query: {q}")
+
+    def _fills_page(self, var):
+        if self.fail_above is not None and var["first"] > self.fail_above:
+            return _FakeResponse(
+                {"errors": [{"message": "statement timeout"}]})
+        w = var["where"]
+        if "or" in w:
+            gt, eq = w["or"]
+            key = (int(gt["timestamp_gt"]), eq["id_gt"])
+            rows = [f for f in self.fills
+                    if (int(f["timestamp"]), f["id"]) > key]
+        else:
+            rows = [f for f in self.fills
+                    if int(f["timestamp"]) >= int(w["timestamp_gte"])]
+        return _FakeResponse(
+            {"data": {"enrichedOrderFilleds": rows[:var["first"]]}})
+
+
+START_TS = 1704067200  # config.BACKFILL_START midnight UTC
+
+
+def _no_sleep(monkeypatch):
+    monkeypatch.setattr(pv.time, "sleep", lambda s: None)
+
+
+def test_notional_is_size_over_1e6_pinned_to_live_reconciliation(
+        monkeypatch, tmp_path):
+    # Live probe: sum(size) over all 243 fills of one token == the
+    # subgraph's own orderbook.collateralVolume == 591728611, and
+    # scaledCollateralVolume == 591.728611. So USD = size / 1e6, no price.
+    _no_sleep(monkeypatch)
+    sizes = [591728611 - 39600000, 39600000]  # split of the verified total
+    fills = [_fill(START_TS + i, f"0xf{i}", "7", s)
+             for i, s in enumerate(sizes)]
+    store = VolumeStore(tmp_path)
+    assert pv.sweep(_FakeGoldsky(fills), store) is True
+    df = pd.read_parquet(store.final_path)
+    assert df["notional_usd"].dtype == "float64"
+    assert df["notional_usd"].sum() == pytest.approx(591.728611)
+    assert df.loc[0, "date"] == pd.Timestamp("2024-01-01")
+
+
+def test_sweep_cursor_resumes_across_portions_without_double_count(
+        monkeypatch, tmp_path):
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 2)
+    # Two fills share a timestamp so resume exercises the id tie-break.
+    fills = [_fill(START_TS, "0xa", "1", 1_000_000),
+             _fill(START_TS, "0xb", "1", 2_000_000),
+             _fill(START_TS + 86400, "0xc", "1", 4_000_000)]
+    assert pv.sweep(_FakeGoldsky(fills), VolumeStore(tmp_path),
+                    max_pages=1) is False
+    state = json.loads((tmp_path / "volumes_cursor.json").read_text())
+    assert state["cursor"] == {"ts": str(START_TS), "id": "0xb"}
+
+    client = _FakeGoldsky(fills)
+    assert pv.sweep(client, VolumeStore(tmp_path)) is True
+    w = client.calls[0]["variables"]["where"]  # resumed via or-cursor
+    assert w["or"][0]["timestamp_gt"] == str(START_TS)
+    assert w["or"][1]["id_gt"] == "0xb"
+    df = pd.read_parquet(tmp_path / "volumes_by_token.parquet")
+    assert df["notional_usd"].sum() == pytest.approx(7.0)  # no replay
+    assert len(df) == 2  # two distinct days
+    assert not (tmp_path / "volumes_cursor.json").exists()
+    assert not (tmp_path / "volumes_parts").exists()
+
+
+def test_flush_boundary_same_token_day_rows_are_summed(monkeypatch, tmp_path):
+    # One (token, day)'s fills landing in different flush shards must SUM
+    # in the merge; first-occurrence dedup would silently drop notional.
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 1)
+    monkeypatch.setattr(pv, "FLUSH_PAGES", 1)
+    fills = [_fill(START_TS, "0xa", "1", 3_000_000),
+             _fill(START_TS + 60, "0xb", "1", 5_000_000)]
+    store = VolumeStore(tmp_path)
+    assert pv.sweep(_FakeGoldsky(fills), store) is True
+    df = pd.read_parquet(store.final_path)
+    assert len(df) == 1
+    assert df.loc[0, "notional_usd"] == pytest.approx(8.0)
+
+
+def test_resume_prunes_uncommitted_flush_shards(monkeypatch, tmp_path):
+    # Crash between shard write and cursor write: the replayed pages would
+    # double-count the orphan shard's sums, so resume() must delete it.
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 1)
+    fills = [_fill(START_TS, "0xa", "1", 1_000_000)]
+    store = VolumeStore(tmp_path)
+    assert pv.sweep(_FakeGoldsky(fills), store, max_pages=1) is False
+    orphan = tmp_path / "volumes_parts" / "b01" / "flush-000099.parquet"
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"token_id": ["1"], "date": [pd.Timestamp("2024-01-01")],
+                  "notional_usd": [999.0]}).to_parquet(orphan, index=False)
+    assert pv.sweep(_FakeGoldsky(fills), store) is True
+    df = pd.read_parquet(store.final_path)
+    assert df["notional_usd"].sum() == pytest.approx(1.0)
+
+
+def test_page_size_halves_on_statement_timeout(monkeypatch, tmp_path):
+    # Live: 1000-row nested-join pages deterministically time out; 500 ok.
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 400)
+    monkeypatch.setattr(pv, "MIN_PAGE_SIZE", 100)
+    fills = [_fill(START_TS + i, f"0x{i:02d}", "1", 1_000_000)
+             for i in range(5)]
+    client = _FakeGoldsky(fills, fail_above=100)
+    assert pv.sweep(client, VolumeStore(tmp_path)) is True
+    firsts = [c["variables"]["first"] for c in client.calls]
+    assert firsts[:3] == [400, 200, 100]  # halved to the working size
+    assert firsts[3:] == [100] * (len(firsts) - 3)  # remembered
+    df = pd.read_parquet(tmp_path / "volumes_by_token.parquet")
+    assert df["notional_usd"].sum() == pytest.approx(5.0)
+
+
+def test_page_size_raises_at_floor(monkeypatch, tmp_path):
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 200)
+    client = _FakeGoldsky([], fail_above=0)
+    with pytest.raises(pv.GoldskyQueryError):
+        pv.sweep(client, VolumeStore(tmp_path))
+
+
+def test_build_token_map_pairs_tokens_and_keeps_unknown_yes(
+        monkeypatch, tmp_path):
+    _no_sleep(monkeypatch)
+    meta = pd.DataFrame({"market_id": ["pm_1", "pm_2"],
+                         "yes_token_id": ["11", "21"]})
+    # Goldsky knows pm_1's condition (yes 11, sibling 12) but not pm_2.
+    client = _FakeGoldsky(market_datas={"11": "0xc1", "12": "0xc1"})
+    store = TokenMapStore(tmp_path)
+    pv.build_token_map(client, store, meta)
+    tm = pd.read_parquet(store.final_path).set_index("token_id")["market_id"]
+    assert tm.to_dict() == {"11": "pm_1", "12": "pm_1", "21": "pm_2"}
+    assert not (tmp_path / "token_map_cursor.json").exists()
+
+
+def test_build_token_map_resumes_from_position(monkeypatch, tmp_path):
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(pv, "TOKEN_MAP_CHUNK", 1)
+    meta = pd.DataFrame({"market_id": ["pm_1", "pm_2"],
+                         "yes_token_id": ["11", "21"]})
+    store = TokenMapStore(tmp_path)
+    store.commit(pd.DataFrame({"token_id": ["11"], "market_id": ["pm_1"]}), 1)
+    client = _FakeGoldsky(market_datas={})
+    pv.build_token_map(client, store, meta)
+    # Only the second market's chunk was fetched after resume.
+    assert [c["variables"]["ids"] for c in client.calls] == [["21"]]
+    tm = pd.read_parquet(store.final_path)
+    assert set(tm["token_id"]) == {"11", "21"}
+
+
+def test_assemble_sums_both_tokens_and_drops_unmapped(tmp_path):
+    d = pd.Timestamp("2024-03-01")
+    pd.DataFrame({
+        "token_id": ["11", "12", "12", "99"],
+        "date": [d, d, d + pd.Timedelta(days=1), d],
+        "notional_usd": [10.0, 5.0, 2.0, 100.0],
+    }).to_parquet(tmp_path / "volumes_by_token.parquet", index=False)
+    pd.DataFrame({"token_id": ["11", "12"], "market_id": ["pm_1", "pm_1"]}
+                 ).to_parquet(tmp_path / "token_map.parquet", index=False)
+    pv.assemble(tmp_path)
+    vol = pd.read_parquet(tmp_path / "volumes.parquet")
+    assert list(vol.columns) == ["market_id", "date", "daily_notional_usd"]
+    assert vol["daily_notional_usd"].dtype == "float64"
+    assert vol.set_index("date")["daily_notional_usd"].to_dict() == {
+        d: 15.0, d + pd.Timedelta(days=1): 2.0}  # token 99 unmapped -> out
+
+
+def _panel_inputs():
+    pm_meta = pd.DataFrame({
+        "market_id": ["pm_1"], "venue": ["polymarket"],
+        "question": ["Will the Fed cut rates?"], "venue_category": [""],
+        "yes_token_id": ["11"], "total_volume_usd": [100000.0],
+        "open_date": pd.to_datetime(["2024-01-01"]),
+        "close_date": pd.to_datetime(["2024-06-01"]),
+    })
+    pm_prices = pd.DataFrame({
+        "market_id": ["pm_1", "pm_1"],
+        "date": pd.to_datetime(["2024-02-01", "2024-02-02"]),
+        "close_prob": [0.4, 0.45],
+    })
+    ka_meta = pd.DataFrame({
+        "market_id": ["ka_X"], "venue": ["kalshi"],
+        "question": ["Will CPI exceed 3%?"], "venue_category": ["Economics"],
+        "event_ticker": ["CPI-24"], "ticker": ["CPI-24-T3"],
+        "series_ticker": ["CPI"], "total_volume_usd": [20000.0],
+        "open_date": pd.to_datetime(["2024-01-01"]),
+        "close_date": pd.to_datetime(["2024-06-01"]),
+    })
+    ka_prices = pd.DataFrame({
+        "market_id": ["ka_X"], "date": pd.to_datetime(["2024-02-01"]),
+        "close_prob": [0.3], "daily_notional_usd": [1500.0],
+    })
+    return pm_meta, pm_prices, ka_meta, ka_prices
+
+
+def test_build_panel_merges_pm_volumes_with_zero_fill_for_pm_only():
+    pm_volumes = pd.DataFrame({
+        "market_id": ["pm_1"], "date": pd.to_datetime(["2024-02-01"]),
+        "daily_notional_usd": [321.5],
+    })
+    _, panel, _ = normalize.build_panel(*_panel_inputs(), pm_volumes)
+    pm = panel[panel["market_id"] == "pm_1"].set_index("date")
+    assert pm.loc[pd.Timestamp("2024-02-01"), "daily_notional_usd"] == 321.5
+    # Active PM day with no fills is genuinely zero notional, not missing.
+    assert pm.loc[pd.Timestamp("2024-02-02"), "daily_notional_usd"] == 0.0
+    ka = panel[panel["market_id"] == "ka_X"]
+    assert (ka["daily_notional_usd"] == 1500.0).all()  # Kalshi untouched
+
+
+def test_build_panel_without_volumes_keeps_pm_nan():
+    _, panel, _ = normalize.build_panel(*_panel_inputs())
+    assert panel.loc[panel["market_id"] == "pm_1",
+                     "daily_notional_usd"].isna().all()
+    assert (panel.loc[panel["market_id"] == "ka_X",
+                      "daily_notional_usd"] == 1500.0).all()
