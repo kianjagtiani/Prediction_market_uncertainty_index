@@ -5,17 +5,22 @@ import pandas as pd
 from . import config
 
 
-def clip_prob(p: np.ndarray) -> np.ndarray:
-    return np.clip(np.asarray(p, dtype=float), config.CLIP_LO, config.CLIP_HI)
+def clip_prob(p: np.ndarray, lo: float | None = None,
+              hi: float | None = None) -> np.ndarray:
+    return np.clip(np.asarray(p, dtype=float),
+                   config.CLIP_LO if lo is None else lo,
+                   config.CLIP_HI if hi is None else hi)
 
 
-def logit(p: np.ndarray) -> np.ndarray:
-    p = clip_prob(p)
+def logit(p: np.ndarray, lo: float | None = None,
+          hi: float | None = None) -> np.ndarray:
+    p = clip_prob(p, lo, hi)
     return np.log(p / (1.0 - p))
 
 
-def binary_entropy(p: np.ndarray) -> np.ndarray:
-    p = clip_prob(p)
+def binary_entropy(p: np.ndarray, lo: float | None = None,
+                   hi: float | None = None) -> np.ndarray:
+    p = clip_prob(p, lo, hi)
     return -(p * np.log2(p) + (1.0 - p) * np.log2(1.0 - p))
 
 

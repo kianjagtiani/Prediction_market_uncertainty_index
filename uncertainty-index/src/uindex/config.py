@@ -13,9 +13,15 @@ SEED_DAYS = 90
 
 # Point-in-time universe rules
 RESOLUTION_EXCLUSION_DAYS = 3
-POLYMARKET_MIN_TOTAL_VOLUME_USD = 50_000
+POLYMARKET_MIN_ROLLING_NOTIONAL_USD = 5_000  # symmetric with Kalshi
 KALSHI_MIN_ROLLING_NOTIONAL_USD = 5_000
 ROLLING_WINDOW_DAYS = 7
+PIN_CONSECUTIVE_DAYS = 5  # observed pinned days before exclusion (causal)
+
+# Ingestion fetch bound only (not a universe rule): a 7-day rolling mean
+# of $5k implies >= $35k lifetime, so lifetime/slack is a lossless
+# prefilter for any configurable rolling floor.
+POLYMARKET_MIN_TOTAL_VOLUME_USD = 50_000
 
 # Ingestion portioning (see scripts/run_backfill.sh)
 METADATA_VOLUME_SLACK = 10  # keep metadata down to floor/10 for robustness sweeps
@@ -30,6 +36,14 @@ POLYMARKET_HISTORY_FIDELITY = 1440
 KALSHI_SLEEP_S = 0.15  # adjust per Task 2 rate-limit findings
 KALSHI_PAGE_SIZE = 1000
 KALSHI_CANDLE_PERIOD_INTERVAL_MINUTES = 1440
+
+# Polymarket PIT daily volume (public Goldsky orderbook subgraph; see
+# docs/research/polymarket-pit-volume-probe.md)
+GOLDSKY_URL = ("https://api.goldsky.com/api/public/"
+               "project_cl6mb8i9h0003e201j6li0diw/subgraphs/"
+               "polymarket-orderbook-resync/prod/gn")
+GOLDSKY_PAGE_SIZE = 1000
+GOLDSKY_SLEEP_S = 0.2
 
 INDEXES = ["GLOBAL", "WAR", "ELECTIONS", "POLITICS", "ECON_FED",
            "CRYPTO", "TECH_AI", "CLIMATE"]

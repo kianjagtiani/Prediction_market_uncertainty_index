@@ -10,19 +10,20 @@ def _weighted_rows(vals: pd.DataFrame, w: pd.DataFrame) -> pd.Series:
     return (vals * w).sum(axis=1, min_count=1) / w.sum(axis=1, min_count=1)
 
 
-def _index_series(sub: pd.DataFrame, ewma_halflife: float) -> pd.DataFrame:
+def _index_series(sub: pd.DataFrame, ewma_halflife: float,
+                  clip_lo: float, clip_hi: float) -> pd.DataFrame:
     """sub: eligible rows of one universe. Returns date-indexed raw gauges."""
     probs = sub.pivot_table(index="date", columns="market_id",
                             values="close_prob", aggfunc="last")
     weights = sub.pivot_table(index="date", columns="market_id",
                               values="weight", aggfunc="last")
 
-    logits = pd.DataFrame(compute.logit(probs.values),
+    logits = pd.DataFrame(compute.logit(probs.values, clip_lo, clip_hi),
                           index=probs.index, columns=probs.columns)
     vols = logits.diff().apply(
         lambda col: compute.ewma_vol(col.dropna(), halflife=ewma_halflife)
     ).reindex(probs.index)
-    entropy = pd.DataFrame(compute.binary_entropy(probs.values),
+    entropy = pd.DataFrame(compute.binary_entropy(probs.values, clip_lo, clip_hi),
                            index=probs.index, columns=probs.columns)
 
     # weight-bearing members only: a priced market with no usable weight
@@ -40,7 +41,9 @@ def compute_indices(flagged_panel: pd.DataFrame,
                     ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Returns (indices, constituents) as tidy frames."""
     p = {"ewma_halflife": config.EWMA_HALFLIFE_DAYS,
-         "seed_days": config.SEED_DAYS, **(params or {})}
+         "seed_days": config.SEED_DAYS,
+         "clip_lo": config.CLIP_LO, "clip_hi": config.CLIP_HI,
+         **(params or {})}
     eligible = flagged_panel[flagged_panel["eligible"]]
 
     tidy, members = [], []
@@ -48,7 +51,8 @@ def compute_indices(flagged_panel: pd.DataFrame,
         sub = eligible[eligible["category"].isin(categories)]
         if sub.empty:
             continue
-        series = _index_series(sub, p["ewma_halflife"])
+        series = _index_series(sub, p["ewma_halflife"],
+                               p["clip_lo"], p["clip_hi"])
         for gauge in ("turbulence", "unresolvedness"):
             raw = series[gauge]
             scaled = compute.percentile_scale(raw, seed_days=p["seed_days"])
