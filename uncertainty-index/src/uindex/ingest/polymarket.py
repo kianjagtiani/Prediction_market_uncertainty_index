@@ -1,13 +1,18 @@
-"""Polymarket ingestion: Gamma (metadata) + CLOB (price history)."""
+"""Polymarket ingestion: Gamma (metadata) + CLOB (price history).
+
+Runs in bounded portions: each invocation advances the crawl by a capped
+amount, checkpoints to disk, and exits 3 if work remains (0 when the venue
+is fully ingested). scripts/run_backfill.sh loops invocations, so memory
+is released to the OS between portions.
+"""
 import json
 import time
-from pathlib import Path
 
 import httpx
 import pandas as pd
 
 from .. import config
-from .store import PriceStore
+from .store import MetaStore, PriceStore
 
 GAMMA_KEYSET_URL = "https://gamma-api.polymarket.com/markets/keyset"
 HISTORY_URL = "https://clob.polymarket.com/prices-history"
@@ -43,6 +48,15 @@ def markets_to_df(markets: list[dict]) -> pd.DataFrame:
     return df
 
 
+def keep(df: pd.DataFrame) -> pd.DataFrame:
+    # The universe filter drops markets below the volume floor, so metadata
+    # far under it can never enter any index and storing it is pure waste
+    # (the raw catalog is 1M+ rows, mostly dead markets). Slack below the
+    # floor is kept so robustness sweeps can lower it without a re-crawl.
+    floor = config.POLYMARKET_MIN_TOTAL_VOLUME_USD / config.METADATA_VOLUME_SLACK
+    return df[df["total_volume_usd"] >= floor]
+
+
 def history_to_df(payload: dict, market_id: str) -> pd.DataFrame:
     pts = payload.get("history", [])
     if not pts:
@@ -57,15 +71,24 @@ def history_to_df(payload: dict, market_id: str) -> pd.DataFrame:
     return df[["market_id", "date", "close_prob"]]
 
 
-def fetch_all_markets(client: httpx.Client) -> pd.DataFrame:
-    # Plain offset pagination 422s past a few thousand results ("offset too
-    # large, use /markets/keyset for deeper pagination" - confirmed live
-    # during the Task 9 backfill run). The keyset endpoint also silently
-    # caps each page at 100 regardless of the requested limit.
-    # Each page is converted to a slim DataFrame immediately: accumulating
-    # raw market dicts for the full catalog previously grew to multi-GB RSS.
-    frames, cursor, n = [], None, 0
-    while True:
+def _flush(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    return (pd.concat(frames, ignore_index=True) if frames
+            else pd.DataFrame(columns=MARKETS_COLUMNS))
+
+
+def crawl_markets(client: httpx.Client, store: MetaStore,
+                  max_pages: int | None = None) -> bool:
+    """Advance the metadata crawl by up to max_pages; True once exhausted.
+
+    Plain offset pagination 422s past a few thousand results ("offset too
+    large, use /markets/keyset for deeper pagination" - confirmed live
+    during the Task 9 backfill run). The keyset endpoint also silently
+    caps each page at 100 regardless of the requested limit.
+    """
+    cursor, n = store.resume()
+    frames: list[pd.DataFrame] = []
+    pages = 0
+    while max_pages is None or pages < max_pages:
         params = {"limit": config.POLYMARKET_PAGE_SIZE,
                   "end_date_min": config.BACKFILL_START}
         if cursor:
@@ -75,17 +98,21 @@ def fetch_all_markets(client: httpx.Client) -> pd.DataFrame:
         payload = r.json()
         batch = payload.get("markets", [])
         if batch:
-            frames.append(markets_to_df(batch))
+            frames.append(keep(markets_to_df(batch)))
             n += len(batch)
         cursor = payload.get("next_cursor")
-        if not batch or not cursor:
-            break
-        if len(frames) % 100 == 0:
-            print(f"  metadata: {n} markets fetched", flush=True)
+        pages += 1
+        done = not batch or not cursor
+        if done or pages % config.INGEST_FLUSH_PAGES == 0:
+            store.commit(_flush(frames), cursor, n)
+            frames = []
+            print(f"  metadata: {n} markets seen", flush=True)
+        if done:
+            store.finalize(MARKETS_COLUMNS)
+            return True
         time.sleep(config.POLYMARKET_SLEEP_S)
-    if not frames:
-        return pd.DataFrame(columns=MARKETS_COLUMNS)
-    return pd.concat(frames, ignore_index=True)
+    store.commit(_flush(frames), cursor, n)
+    return False
 
 
 def history_todo(meta: pd.DataFrame, done: set[str]) -> pd.DataFrame:
@@ -106,34 +133,48 @@ def fetch_history(client: httpx.Client, token_id: str) -> dict:
     return r.json()
 
 
-def main() -> None:
+def main(pages: int | None = None, markets: int | None = None) -> bool:
+    """One portion of work. Returns True when the venue is fully ingested."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     client = httpx.Client(timeout=30)
 
-    markets_path = OUT_DIR / "markets.parquet"
-    if markets_path.exists():
-        meta = pd.read_parquet(markets_path)
-    else:
-        meta = fetch_all_markets(client)
-        meta.to_parquet(markets_path, index=False)
-    print(f"{len(meta)} polymarket markets")
+    meta_store = MetaStore(OUT_DIR)
+    if not meta_store.complete:
+        crawl_markets(client, meta_store, pages)
+        return False  # prices start in a fresh process either way
 
+    meta = pd.read_parquet(meta_store.final_path)
     store = PriceStore(OUT_DIR)
     todo = history_todo(meta, store.done_ids())
-    print(f"{len(todo)} markets to fetch after volume pre-filter")
-    for i, row in enumerate(todo.itertuples(index=False)):
+    print(f"{len(meta)} markets; {len(todo)} left after volume pre-filter")
+    portion = todo if markets is None else todo.head(markets)
+    for i, row in enumerate(portion.itertuples(index=False)):
         try:
-            store.append(history_to_df(fetch_history(client, row.yes_token_id),
-                                       row.market_id))
+            df = history_to_df(fetch_history(client, row.yes_token_id),
+                               row.market_id)
+            store.append(df) if not df.empty else store.mark_no_data(row.market_id)
         except httpx.HTTPStatusError as e:
             print(f"skip {row.market_id}: {e.response.status_code}")
+            store.mark_no_data(row.market_id)
         time.sleep(config.POLYMARKET_SLEEP_S)
-        if i % 200 == 199:  # checkpoint so the run is resumable
+        if i % 200 == 199:
             store.checkpoint()
-            print(f"checkpoint: {i + 1}/{len(todo)}")
+            print(f"checkpoint: {i + 1}/{len(portion)} this portion")
+    store.checkpoint()
+    if markets is not None and len(todo) > markets:
+        return False
     store.finalize()
     print("polymarket ingestion complete")
+    return True
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    import sys
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pages", type=int, default=500,
+                    help="metadata pages per portion (0 = unbounded)")
+    ap.add_argument("--markets", type=int, default=2000,
+                    help="price fetches per portion (0 = unbounded)")
+    a = ap.parse_args()
+    sys.exit(0 if main(a.pages or None, a.markets or None) else 3)

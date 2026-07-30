@@ -17,6 +17,10 @@ POLYMARKET_MIN_TOTAL_VOLUME_USD = 50_000
 KALSHI_MIN_ROLLING_NOTIONAL_USD = 5_000
 ROLLING_WINDOW_DAYS = 7
 
+# Ingestion portioning (see scripts/run_backfill.sh)
+METADATA_VOLUME_SLACK = 10  # keep metadata down to floor/10 for robustness sweeps
+INGEST_FLUSH_PAGES = 50     # metadata pages held in RAM between shard writes
+
 # Polymarket ingestion
 POLYMARKET_SLEEP_S = 0.3  # adjust per Task 2 rate-limit findings
 POLYMARKET_PAGE_SIZE = 500

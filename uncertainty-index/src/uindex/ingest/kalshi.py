@@ -1,4 +1,10 @@
-"""Kalshi ingestion: public trade API v2 markets + daily candlesticks."""
+"""Kalshi ingestion: public trade API v2 markets + daily candlesticks.
+
+Runs in bounded portions: each invocation advances the crawl by a capped
+amount, checkpoints to disk, and exits 3 if work remains (0 when the venue
+is fully ingested). scripts/run_backfill.sh loops invocations, so memory
+is released to the OS between portions.
+"""
 import time
 from datetime import datetime, timezone
 
@@ -6,7 +12,7 @@ import httpx
 import pandas as pd
 
 from .. import config
-from .store import PriceStore
+from .store import MetaStore, PriceStore
 
 BASE = "https://api.elections.kalshi.com/trade-api/v2"
 OUT_DIR = config.DATA_DIR / "raw" / "kalshi"
@@ -37,10 +43,22 @@ def markets_to_df(markets: list[dict]) -> pd.DataFrame:
             "open_date": m.get("open_time"),
             "close_date": m.get("close_time"),
         })
+    if not rows:
+        return pd.DataFrame(columns=MARKETS_COLUMNS)
     df = pd.DataFrame(rows)
     for col in ("open_date", "close_date"):
         df[col] = pd.to_datetime(df[col], utc=True, errors="coerce").dt.tz_localize(None)
     return df
+
+
+def keep(df: pd.DataFrame) -> pd.DataFrame:
+    # Same provable bound as history_todo (true notional <= 2x the $0.50
+    # proxy), with slack below the rolling floor kept so robustness sweeps
+    # can lower it without a re-crawl. This is what collapses the 10M+ row
+    # raw catalog (every strike variant, overwhelmingly zero-volume) to a
+    # size an 8 GB machine can hold.
+    floor = config.KALSHI_MIN_ROLLING_NOTIONAL_USD / config.METADATA_VOLUME_SLACK
+    return df[df["total_volume_usd"] * 2 >= floor]
 
 
 def candles_to_df(payload: dict, market_id: str) -> pd.DataFrame:
@@ -66,14 +84,20 @@ def candles_to_df(payload: dict, market_id: str) -> pd.DataFrame:
     return df.drop_duplicates(subset="date", keep="last")
 
 
-def fetch_all_markets(client: httpx.Client) -> pd.DataFrame:
-    # Each page is converted to a slim DataFrame immediately: accumulating
-    # raw dicts for the full catalog (every strike variant since 2024) hit
-    # ~9 GB RSS and never finished on an 8 GB machine.
+def _flush(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    return (pd.concat(frames, ignore_index=True) if frames
+            else pd.DataFrame(columns=MARKETS_COLUMNS))
+
+
+def crawl_markets(client: httpx.Client, store: MetaStore,
+                  max_pages: int | None = None) -> bool:
+    """Advance the metadata crawl by up to max_pages; True once exhausted."""
     min_close = int(datetime.fromisoformat(config.BACKFILL_START)
                     .replace(tzinfo=timezone.utc).timestamp())
-    frames, cursor, n = [], None, 0
-    while True:
+    cursor, n = store.resume()
+    frames: list[pd.DataFrame] = []
+    pages = 0
+    while max_pages is None or pages < max_pages:
         params = {"limit": config.KALSHI_PAGE_SIZE, "min_close_ts": min_close}
         if cursor:
             params["cursor"] = cursor
@@ -82,17 +106,21 @@ def fetch_all_markets(client: httpx.Client) -> pd.DataFrame:
         j = r.json()
         batch = j.get("markets", [])
         if batch:
-            frames.append(markets_to_df(batch))
+            frames.append(keep(markets_to_df(batch)))
             n += len(batch)
-            if len(frames) % 50 == 0:
-                print(f"  metadata: {n} markets fetched", flush=True)
         cursor = j.get("cursor")
-        if not cursor:
-            break
+        pages += 1
+        done = not batch or not cursor
+        if done or pages % config.INGEST_FLUSH_PAGES == 0:
+            store.commit(_flush(frames), cursor, n)
+            frames = []
+            print(f"  metadata: {n} markets seen", flush=True)
+        if done:
+            store.finalize(MARKETS_COLUMNS)
+            return True
         time.sleep(config.KALSHI_SLEEP_S)
-    if not frames:
-        return pd.DataFrame(columns=MARKETS_COLUMNS)
-    return pd.concat(frames, ignore_index=True)
+    store.commit(_flush(frames), cursor, n)
+    return False
 
 
 def history_todo(meta: pd.DataFrame, done: set[str]) -> pd.DataFrame:
@@ -150,36 +178,54 @@ def fetch_candles(client: httpx.Client, series: str, ticker: str,
     return r.json()
 
 
-def main() -> None:
+def main(pages: int | None = None, markets: int | None = None) -> bool:
+    """One portion of work. Returns True when the venue is fully ingested."""
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     client = httpx.Client(timeout=30)
 
-    markets_path = OUT_DIR / "markets.parquet"
-    if markets_path.exists():
-        meta = pd.read_parquet(markets_path)
-    else:
-        meta = fetch_all_markets(client)
-        meta.to_parquet(markets_path, index=False)
-    print(f"{len(meta)} kalshi markets")
+    meta_store = MetaStore(OUT_DIR)
+    if not meta_store.complete:
+        crawl_markets(client, meta_store, pages)
+        return False  # candles start in a fresh process either way
 
+    meta = pd.read_parquet(meta_store.final_path)
     store = PriceStore(OUT_DIR)
     todo = history_todo(meta, store.done_ids())
-    print(f"{len(todo)} markets to fetch after notional pre-filter")
-    for i, row in enumerate(todo.itertuples(index=False)):
+    print(f"{len(meta)} markets; {len(todo)} left after notional pre-filter")
+    portion = todo if markets is None else todo.head(markets)
+    for i, row in enumerate(portion.itertuples(index=False)):
+        if pd.isna(row.open_date) or pd.isna(row.close_date):
+            store.mark_no_data(row.market_id)
+            continue
         start = int(row.open_date.replace(tzinfo=timezone.utc).timestamp())
         end = int(row.close_date.replace(tzinfo=timezone.utc).timestamp())
         try:
-            payload = fetch_candles(client, row.series_ticker, row.ticker, start, end)
-            store.append(candles_to_df(payload, row.market_id))
+            payload = fetch_candles(client, row.series_ticker, row.ticker,
+                                    start, end)
+            df = candles_to_df(payload, row.market_id)
+            store.append(df) if not df.empty else store.mark_no_data(row.market_id)
         except httpx.HTTPStatusError as e:
             print(f"skip {row.market_id}: {e.response.status_code}")
+            store.mark_no_data(row.market_id)
         time.sleep(config.KALSHI_SLEEP_S)
         if i % 200 == 199:
             store.checkpoint()
-            print(f"checkpoint: {i + 1}/{len(todo)}")
+            print(f"checkpoint: {i + 1}/{len(portion)} this portion")
+    store.checkpoint()
+    if markets is not None and len(todo) > markets:
+        return False
     store.finalize()
     print("kalshi ingestion complete")
+    return True
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    import sys
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pages", type=int, default=500,
+                    help="metadata pages per portion (0 = unbounded)")
+    ap.add_argument("--markets", type=int, default=2000,
+                    help="candle fetches per portion (0 = unbounded)")
+    a = ap.parse_args()
+    sys.exit(0 if main(a.pages or None, a.markets or None) else 3)

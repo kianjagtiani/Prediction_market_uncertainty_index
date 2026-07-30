@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from uindex.ingest import kalshi
+from uindex.ingest.store import MetaStore
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -44,39 +45,75 @@ def test_markets_to_df_total_volume_usd_from_volume_fp():
     assert df["total_volume_usd"].iloc[0] == 100.0
 
 
-def _api_market(ticker):
+def _api_market(ticker, volume_fp="1000.00"):
     return {
         "ticker": ticker,
         "event_ticker": ticker.split("-")[0],
         "title": f"Market {ticker}",
-        "volume_fp": "10.00",
+        "volume_fp": volume_fp,
         "open_time": "2024-01-01T00:00:00Z",
         "close_time": "2024-02-01T00:00:00Z",
     }
 
 
-def test_fetch_all_markets_streams_pages_to_slim_df(monkeypatch):
-    # Returns a converted DataFrame, not raw dicts: Kalshi's full catalog of
-    # raw market dicts hit ~9 GB RSS and never finished on the 8 GB machine.
-    monkeypatch.setattr(kalshi.time, "sleep", lambda s: None)
-    pages = {
-        None: {"markets": [_api_market("AAA-1"), _api_market("AAA-2")],
-               "cursor": "next1"},
-        "next1": {"markets": [_api_market("BBB-1")], "cursor": "next2"},
-        "next2": {"markets": [], "cursor": ""},  # empty final page
-    }
-    calls = []
-
+def _pages_client(pages, calls):
     def handler(request):
         cursor = request.url.params.get("cursor")
         calls.append(dict(request.url.params))
         return httpx.Response(200, json=pages[cursor or None])
+    return _mock_client(handler)
 
-    df = kalshi.fetch_all_markets(_mock_client(handler))
-    assert isinstance(df, pd.DataFrame)
+
+_PAGES = {
+    None: {"markets": [_api_market("AAA-1"), _api_market("AAA-2")],
+           "cursor": "next1"},
+    "next1": {"markets": [_api_market("BBB-1")], "cursor": "next2"},
+    "next2": {"markets": [], "cursor": ""},  # empty final page
+}
+
+
+def test_crawl_markets_writes_final_parquet(monkeypatch, tmp_path):
+    # Pages stream to disk shards, never a whole-catalog list: the raw
+    # catalog hit ~9 GB RSS and never finished on the 8 GB machine.
+    monkeypatch.setattr(kalshi.time, "sleep", lambda s: None)
+    calls = []
+    store = MetaStore(tmp_path)
+    assert kalshi.crawl_markets(_pages_client(_PAGES, calls), store) is True
+
+    df = pd.read_parquet(tmp_path / "markets.parquet")
     assert list(df["market_id"]) == ["ka_AAA-1", "ka_AAA-2", "ka_BBB-1"]
     assert "cursor" not in calls[0]
     assert calls[1]["cursor"] == "next1"
+    assert store.complete
+    assert not (tmp_path / "markets_cursor.json").exists()
+
+
+def test_crawl_markets_portion_resumes_from_saved_cursor(monkeypatch, tmp_path):
+    monkeypatch.setattr(kalshi.time, "sleep", lambda s: None)
+    store = MetaStore(tmp_path)
+    calls = []
+    assert kalshi.crawl_markets(_pages_client(_PAGES, calls),
+                                store, max_pages=1) is False
+    assert not store.complete
+
+    resumed_calls = []
+    assert kalshi.crawl_markets(_pages_client(_PAGES, resumed_calls),
+                                MetaStore(tmp_path)) is True
+    assert resumed_calls[0]["cursor"] == "next1"  # no page refetched
+    df = pd.read_parquet(tmp_path / "markets.parquet")
+    assert list(df["market_id"]) == ["ka_AAA-1", "ka_AAA-2", "ka_BBB-1"]
+
+
+def test_crawl_markets_keep_filter_drops_dead_strikes(monkeypatch, tmp_path):
+    # Zero-volume strike variants are the bulk of the 10M+ row catalog;
+    # anything under floor/slack can never enter any index.
+    monkeypatch.setattr(kalshi.time, "sleep", lambda s: None)
+    pages = {None: {"markets": [_api_market("AAA-1", volume_fp="0.00"),
+                                _api_market("AAA-2")], "cursor": ""}}
+    store = MetaStore(tmp_path)
+    assert kalshi.crawl_markets(_pages_client(pages, []), store) is True
+    df = pd.read_parquet(tmp_path / "markets.parquet")
+    assert list(df["market_id"]) == ["ka_AAA-2"]
 
 
 def test_history_todo_skips_done_and_provably_ineligible():
