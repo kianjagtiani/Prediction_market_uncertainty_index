@@ -77,16 +77,31 @@ def history_to_df(payload: dict, market_id: str) -> pd.DataFrame:
 def crawl_markets(client: httpx.Client, store: MetaStore,
                   max_pages: int | None = None) -> bool:
     """Plain offset pagination 422s past a few thousand results; the keyset
-    endpoint paginates arbitrarily deep but silently caps pages at 100."""
+    endpoint paginates arbitrarily deep but silently caps pages at 100.
+
+    The pagination param is `after_cursor` (per the OpenAPI spec). Gamma
+    silently ignores unknown params, so a wrong name replays page 1 forever
+    with a fresh-looking next_cursor - which is exactly how the first two
+    backfill attempts crawled 1M+ "markets" that were 100 unique ones.
+    """
+    last_first = None
+
     def fetch_page(cursor):
+        nonlocal last_first
         params = {"limit": config.POLYMARKET_PAGE_SIZE,
                   "end_date_min": config.BACKFILL_START}
         if cursor:
-            params["cursor"] = cursor
+            params["after_cursor"] = cursor
         r = client.get(GAMMA_KEYSET_URL, params=params)
         r.raise_for_status()
         j = r.json()
         batch = j.get("markets", [])
+        if batch:
+            if batch[0].get("id") == last_first:
+                raise RuntimeError(
+                    f"pagination stuck: page repeated (first id "
+                    f"{last_first}); cursor not advancing")
+            last_first = batch[0].get("id")
         return (keep(markets_to_df(batch)) if batch else pd.DataFrame(),
                 len(batch), j.get("next_cursor"))
 

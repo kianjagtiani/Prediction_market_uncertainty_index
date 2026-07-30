@@ -14,12 +14,26 @@ implementation plan is not yet written.
 
 ```bash
 cd uncertainty-index
-# backfill (resumes from checkpoint: 1,825,500 PM markets seen):
+# backfill (PM metadata restarts from zero after the pagination fix below;
+# the real catalog is ~268k markets ≈ ~2,700 pages ≈ ~30 min of crawling):
 caffeinate -i scripts/run_backfill.sh polymarket && \
 caffeinate -i scripts/run_backfill.sh kalshi
 # after PM metadata+prices: scripts/run_backfill.sh polymarket_volume
 # then: normalize -> pipeline -> validate modules (Task 9 in docs/plans/)
 ```
+
+### 2026-07-30 post-pause fix: keyset pagination was silently stuck
+
+The "1,825,500 markets seen" checkpoint was garbage: **100 unique
+markets**, page 1 refetched ~18k times. Gamma's keyset endpoint takes
+`after_cursor` (per its OpenAPI spec) and silently ignores unknown
+params — we sent `cursor`, so every request returned page 1 with a
+fresh-looking next_cursor. This same bug explains the original July run
+"fetching" 1.04M markets from a ~268k catalog before dying. Fixed
+(`after_cursor`, live-verified two distinct pages), garbage crawl state
+deleted, and both venues' crawls now carry a stuck-pagination tripwire
+that raises if a page's first id repeats — so Kalshi's suspicious 10.3M
+count from July gets adjudicated within seconds of its next run.
 
 Also to re-run: (a) the negRisk coverage probe, (b) the adversarial
 review of commit `0362ca8` — both described under "Open items".

@@ -88,8 +88,10 @@ def crawl_markets(client: httpx.Client, store: MetaStore,
                   max_pages: int | None = None) -> bool:
     min_close = int(datetime.fromisoformat(config.BACKFILL_START)
                     .replace(tzinfo=timezone.utc).timestamp())
+    last_first = None
 
     def fetch_page(cursor):
+        nonlocal last_first
         params = {"limit": config.KALSHI_PAGE_SIZE, "min_close_ts": min_close}
         if cursor:
             params["cursor"] = cursor
@@ -97,6 +99,14 @@ def crawl_markets(client: httpx.Client, store: MetaStore,
         r.raise_for_status()
         j = r.json()
         batch = j.get("markets", [])
+        if batch:
+            # Same tripwire as Polymarket: a silently-ignored cursor param
+            # replays page 1 forever; fail in seconds, not gigabytes.
+            if batch[0].get("ticker") == last_first:
+                raise RuntimeError(
+                    f"pagination stuck: page repeated (first ticker "
+                    f"{last_first}); cursor not advancing")
+            last_first = batch[0].get("ticker")
         return (keep(markets_to_df(batch)) if batch else pd.DataFrame(),
                 len(batch), j.get("cursor"))
 

@@ -82,7 +82,7 @@ class _FakeKeysetClient:
     def get(self, url, params):
         assert url == pm.GAMMA_KEYSET_URL
         self.calls.append(params)
-        return _FakeResponse(self._pages[params.get("cursor")])
+        return _FakeResponse(self._pages[params.get("after_cursor")])
 
 
 def test_crawl_markets_writes_final_parquet(monkeypatch, tmp_path):
@@ -96,8 +96,8 @@ def test_crawl_markets_writes_final_parquet(monkeypatch, tmp_path):
     df = pd.read_parquet(tmp_path / "markets.parquet")
     assert list(df.columns) == pm.MARKETS_COLUMNS
     assert list(df["market_id"]) == ["pm_1", "pm_2", "pm_3"]
-    assert "cursor" not in client.calls[0]  # first page has no cursor
-    assert client.calls[1]["cursor"] == "abc"
+    assert "after_cursor" not in client.calls[0]  # first page bare
+    assert client.calls[1]["after_cursor"] == "abc"
     assert not (tmp_path / "markets_cursor.json").exists()
 
 
@@ -109,7 +109,7 @@ def test_crawl_markets_portion_resumes_from_saved_cursor(monkeypatch, tmp_path):
 
     client = _FakeKeysetClient()
     assert pm.crawl_markets(client, MetaStore(tmp_path)) is True
-    assert client.calls[0]["cursor"] == "abc"  # no page refetched
+    assert client.calls[0]["after_cursor"] == "abc"  # no page refetched
     df = pd.read_parquet(tmp_path / "markets.parquet")
     assert list(df["market_id"]) == ["pm_1", "pm_2", "pm_3"]
 
@@ -125,6 +125,16 @@ def test_crawl_markets_keep_filter_drops_dead_markets(monkeypatch, tmp_path):
     assert pm.crawl_markets(client, MetaStore(tmp_path)) is True
     df = pd.read_parquet(tmp_path / "markets.parquet")
     assert list(df["market_id"]) == ["pm_2"]
+
+
+def test_crawl_markets_raises_when_pagination_stuck(monkeypatch, tmp_path):
+    # Gamma silently ignores unknown params: a wrong cursor name replays
+    # page 1 forever with a fresh next_cursor. Fail fast, not at 1.8M rows.
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    page = {"markets": [_api_market("1")], "next_cursor": "always-new"}
+    client = _FakeKeysetClient({None: page, "always-new": page})
+    with pytest.raises(RuntimeError, match="pagination stuck"):
+        pm.crawl_markets(client, MetaStore(tmp_path))
 
 
 def test_history_todo_skips_done_and_below_slack_floor():

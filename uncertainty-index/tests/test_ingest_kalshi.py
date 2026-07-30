@@ -104,6 +104,15 @@ def test_crawl_markets_portion_resumes_from_saved_cursor(monkeypatch, tmp_path):
     assert list(df["market_id"]) == ["ka_AAA-1", "ka_AAA-2", "ka_BBB-1"]
 
 
+def test_crawl_markets_raises_when_pagination_stuck(monkeypatch, tmp_path):
+    monkeypatch.setattr(kalshi.time, "sleep", lambda s: None)
+    page = {"markets": [_api_market("AAA-1")], "cursor": "always-new"}
+    calls = []
+    with pytest.raises(RuntimeError, match="pagination stuck"):
+        kalshi.crawl_markets(_pages_client({None: page, "always-new": page},
+                                           calls), MetaStore(tmp_path))
+
+
 def test_crawl_markets_keep_filter_drops_dead_strikes(monkeypatch, tmp_path):
     # Zero-volume strike variants are the bulk of the 10M+ row catalog;
     # anything under floor/slack can never enter any index.
