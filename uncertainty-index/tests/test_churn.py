@@ -33,9 +33,34 @@ def daily():
     return churn.decompose(_flagged())
 
 
-def test_identity_delta_equals_repricing_plus_membership(daily):
+def test_identity_delta_equals_sum_of_components(daily):
     assert (daily["delta_raw"]
-            - daily["repricing"] - daily["membership"]).abs().max() < 1e-12
+            - daily[churn.COMPONENTS].sum(axis=1)).abs().max() < 1e-12
+
+
+def _stable_vols():
+    """Two markets alternating between fixed prices: |Δlogit| is constant,
+    so each EWMA vol is exactly flat and any index move must be weights."""
+    rows = [{"date": d, "market_id": mid, "weight": 1.0,
+             "close_prob": lo if i % 2 == 0 else hi,
+             "eligible_turbulence": True, "category": "WAR"}
+            for mid, lo, hi in (("A", 0.45, 0.55), ("B", 0.30, 0.70))
+            for i, d in enumerate(DATES)]
+    return pd.DataFrame(rows)
+
+
+def test_pure_weight_drift_is_reweighting_not_repricing():
+    """Identical prices and identical membership on both days; only one
+    market's liquidity weight jumps. The two-way split booked all of that
+    as 'news moving prices of the standing membership'."""
+    flagged = _stable_vols()
+    jump = (flagged["market_id"] == "B") & (flagged["date"] >= DATES[25])
+    flagged.loc[jump, "weight"] = 40.0
+    row = churn.decompose(flagged).loc[DATES[25]]
+    assert abs(row["delta_raw"]) > 1e-6
+    assert row["reweighting"] == pytest.approx(row["delta_raw"])
+    assert row["repricing"] == pytest.approx(0.0, abs=1e-12)
+    assert row["membership"] == pytest.approx(0.0, abs=1e-12)
 
 
 def test_membership_dominates_on_entry_day(daily):

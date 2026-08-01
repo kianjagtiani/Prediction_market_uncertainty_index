@@ -70,10 +70,13 @@ def main() -> None:
                   robust.to_markdown(index=False)]
     lines += ["", "## Churn audit", ""]
     if churn_daily is not None:
-        share = churn.membership_share(churn_daily)
-        lines.append(f"Membership share of total |Δraw| (GLOBAL turbulence) = "
-                     f"**{share:.3f}** (guideline <= 0.20; large means "
-                     f"membership churn, not repricing, moves the index).")
+        s = churn.shares(churn_daily)
+        lines.append("Shares of total |Δraw| (GLOBAL turbulence): "
+                     + ", ".join(f"{k} **{v:.3f}**" for k, v in s.items())
+                     + f". Membership guideline <= 0.20. Reweighting is pure "
+                     f"liquidity-weight drift on an unchanged membership at "
+                     f"unchanged prices — a large share means the index is "
+                     f"tracking who is liquid, not what the news is.")
     else:
         lines.append("churn.csv not found — run `python -m uindex.validate.churn`.")
 

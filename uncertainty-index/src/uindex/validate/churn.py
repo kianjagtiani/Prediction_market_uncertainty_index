@@ -1,15 +1,20 @@
-"""Churn audit: split daily GLOBAL turbulence moves into repricing vs membership.
+"""Churn audit: split daily GLOBAL turbulence moves three ways.
 
 Reference decomposition — deliberately re-derives the pipeline's turbulence
 math from compute primitives (logit-diff EWMA vols, row-wise weighted means)
-so it never imports private pipeline internals. For each step t,
+so it never imports private pipeline internals. For each step t, with C_t the
+set of weight-bearing members present on BOTH t-1 and t,
 
-    repricing_t  = wmean(vol_t, w_t | C_t) - wmean(vol_{t-1}, w_{t-1} | C_t)
-    membership_t = (raw_t - raw_{t-1}) - repricing_t
+    repricing_t   = wmean(vol_t,   w_{t-1} | C_t) - wmean(vol_{t-1}, w_{t-1} | C_t)
+    reweighting_t = wmean(vol_t,   w_t     | C_t) - wmean(vol_t,     w_{t-1} | C_t)
+    membership_t  = (raw_t - raw_{t-1}) - repricing_t - reweighting_t
 
-where C_t is the set of weight-bearing members present on BOTH t-1 and t
-(each day keeps its own weights). Repricing captures news moving prices of
-the standing membership; membership is the remainder driven by entries/exits.
+Repricing holds the weights fixed at yesterday's, so it is news moving the
+prices of the standing membership and nothing else. Reweighting is the
+separate term the two-way split used to bury inside repricing: every
+market's weight is now a daily function of trailing notional, so liquidity
+drift alone moves the index and the audit has to see it. Membership is the
+remainder driven by entries and exits.
 """
 import pandas as pd
 
@@ -24,7 +29,8 @@ def _wmean_rows(vals: pd.DataFrame, weights: pd.DataFrame,
 
 def decompose(flagged: pd.DataFrame,
               params: dict | None = None) -> pd.DataFrame:
-    """Daily frame (date-indexed): delta_raw, repricing, membership."""
+    """Daily frame (date-indexed): delta_raw, repricing, reweighting,
+    membership."""
     p = {"ewma_halflife": config.EWMA_HALFLIFE_DAYS,
          "clip_lo": config.CLIP_LO, "clip_hi": config.CLIP_HI,
          **(params or {})}
@@ -45,20 +51,33 @@ def decompose(flagged: pd.DataFrame,
     raw = _wmean_rows(vols, weights, member)
 
     common = member & member.shift(1, fill_value=False)
-    repricing = (_wmean_rows(vols, weights, common)
-                 - _wmean_rows(vols.shift(1), weights.shift(1), common))
+    w_prev = weights.shift(1)
+    at_old_w = _wmean_rows(vols, w_prev, common)
+    repricing = at_old_w - _wmean_rows(vols.shift(1), w_prev, common)
+    reweighting = _wmean_rows(vols, weights, common) - at_old_w
     # full-turnover step: nothing to reprice, the whole move is membership
-    repricing = repricing.where(common.any(axis=1), 0.0)
-
-    out = pd.DataFrame({"delta_raw": raw.diff(), "repricing": repricing})
-    out["membership"] = out["delta_raw"] - out["repricing"]
+    keep = common.any(axis=1)
+    out = pd.DataFrame({"delta_raw": raw.diff(),
+                        "repricing": repricing.where(keep, 0.0),
+                        "reweighting": reweighting.where(keep, 0.0)})
+    out["membership"] = (out["delta_raw"] - out["repricing"]
+                         - out["reweighting"])
     return out.dropna(subset=["delta_raw"])
+
+
+COMPONENTS = ["repricing", "reweighting", "membership"]
+
+
+def shares(daily: pd.DataFrame) -> dict[str, float]:
+    """Each component's share of total |delta_raw|."""
+    total = daily["delta_raw"].abs().sum()
+    return {c: float(daily[c].abs().sum() / total) if total else float("nan")
+            for c in COMPONENTS}
 
 
 def membership_share(daily: pd.DataFrame) -> float:
     """Membership share of total |delta_raw| (guideline <= 0.20)."""
-    total = daily["delta_raw"].abs().sum()
-    return float(daily["membership"].abs().sum() / total) if total else float("nan")
+    return shares(daily)["membership"]
 
 
 def main() -> None:
@@ -71,9 +90,11 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     daily.to_csv(out, index_label="date")
 
-    share = membership_share(daily)
-    print(f"membership share of total |delta raw|: {share:.3f} "
-          f"(guideline <= 0.20: {'pass' if share <= 0.20 else 'CHECK'})")
+    s = shares(daily)
+    for name, share in s.items():
+        print(f"{name:12s} share of total |delta raw|: {share:.3f}")
+    print(f"membership guideline <= 0.20: "
+          f"{'pass' if s['membership'] <= 0.20 else 'CHECK'}")
 
 
 if __name__ == "__main__":
