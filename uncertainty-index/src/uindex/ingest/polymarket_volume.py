@@ -467,6 +467,44 @@ def assemble(out_dir: Path) -> None:
     print(f"volumes.parquet: {n_rows} market-days")
 
 
+def write_coverage_report(out_dir: Path) -> None:
+    """Per-market swept notional vs Gamma's lifetime volume.
+
+    The two venues' daily_notional_usd are built differently — Kalshi is
+    volume_fp * close_prob (contracts x price, one leg per market),
+    Polymarket is the USDC collateral leg of CLOB fills summed over BOTH
+    outcome tokens — and a single eligibility floor is applied to both.
+    That equality is assumed, not verified: the live probe reconciled one
+    token's sum(size) against that token's own collateralVolume, never the
+    both-token sum against a per-market ground truth.
+
+    This report is the evidence trail. It also catches the known coverage
+    hole: the subgraph does not index negRisk or legacy AMM fills, and
+    without it normalize's zero-fill would convert "not indexed by this
+    subgraph" into "genuinely zero notional", dropping those markets under
+    the liquidity floor with nothing anywhere showing it.
+    """
+    vol = pd.read_parquet(out_dir / "volumes.parquet",
+                          columns=["market_id", "daily_notional_usd"])
+    meta = pd.read_parquet(out_dir / "markets.parquet",
+                           columns=["market_id", "total_volume_usd"])
+    swept = vol.groupby("market_id")["daily_notional_usd"].sum()
+    rep = meta.assign(
+        subgraph_notional_usd=meta["market_id"].map(swept).fillna(0.0))
+    rep["coverage"] = (rep["subgraph_notional_usd"]
+                       / rep["total_volume_usd"].mask(
+                           rep["total_volume_usd"] <= 0))
+    # NaN coverage (no Gamma volume to compare against) is not evidence of
+    # coverage, and NaN >= x is already False.
+    rep["covered"] = rep["coverage"] >= config.PM_MIN_SUBGRAPH_COVERAGE
+    rep.to_csv(out_dir / "volumes_coverage.csv", index=False)
+    n_bad = int((~rep["covered"]).sum())
+    print(f"volumes_coverage.csv: {n_bad}/{len(rep)} PM markets swept less "
+          f"than {config.PM_MIN_SUBGRAPH_COVERAGE:.0%} of their Gamma "
+          f"lifetime volume; their market-days stay NaN, not $0"
+          + (" -- CHECK negRisk/AMM coverage" if n_bad else ""))
+
+
 def _wait_for_markets(out_dir: Path) -> None:
     """Poll gently for the metadata crawl, but not forever. Exit 3 resets
     the driver's failure counter, so an unbounded wait spins one process a
@@ -506,6 +544,7 @@ def main(pages: int | None = None) -> bool:
                                    columns=["market_id", "yes_token_id"])
             build_token_map(client, tmap, meta)
     assemble(OUT_DIR)
+    write_coverage_report(OUT_DIR)
     print("polymarket volume ingestion complete")
     return True
 

@@ -38,10 +38,24 @@ def volume_coverage(raw_dir) -> tuple[pd.Timestamp, pd.Timestamp] | None:
     return pd.Timestamp(m["first_date"]), pd.Timestamp(m["last_date"])
 
 
+def uncovered_markets(raw_dir) -> set[str]:
+    """PM markets the Goldsky sweep does not cover (negRisk, legacy AMM).
+
+    Written by polymarket_volume.write_coverage_report. Absent means the
+    report was never run, which is not evidence of coverage — the caller
+    warns and zero-fills nothing."""
+    path = Path(raw_dir) / "polymarket" / "volumes_coverage.csv"
+    if not path.exists():
+        return set()
+    rep = pd.read_csv(path)
+    return set(rep.loc[~rep["covered"].astype(bool), "market_id"])
+
+
 def build_panel(pm_meta: pd.DataFrame, pm_prices: pd.DataFrame,
                 ka_meta: pd.DataFrame, ka_prices: pd.DataFrame,
                 pm_volumes: pd.DataFrame | None = None,
-                coverage: tuple[pd.Timestamp, pd.Timestamp] | None = None
+                coverage: tuple[pd.Timestamp, pd.Timestamp] | None = None,
+                uncovered: set[str] = frozenset()
                 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     pm = pm_meta.copy()
     pm["event_ticker"] = np.nan
@@ -69,14 +83,19 @@ def build_panel(pm_meta: pd.DataFrame, pm_prices: pd.DataFrame,
             print("WARNING: no volumes_manifest.json - PM market-days with "
                   "no fills stay NaN (ineligible), not $0")
         else:
-            inside = pmp["date"].between(*coverage)
+            # Same logic per market: a market the subgraph does not index
+            # (negRisk, legacy AMM) has no fills for reasons that have
+            # nothing to do with how much it traded.
+            inside = (pmp["date"].between(*coverage)
+                      & ~pmp["market_id"].isin(uncovered))
             pmp.loc[inside, "daily_notional_usd"] = (
                 pmp.loc[inside, "daily_notional_usd"].fillna(0.0))
             outside = int((~inside).sum())
             if outside:
-                print(f"normalize: {outside} PM market-days fall outside the "
-                      f"volume sweep's coverage {coverage[0].date()}..."
-                      f"{coverage[1].date()} and stay NaN (ineligible)")
+                print(f"normalize: {outside} PM market-days are outside the "
+                      f"volume sweep's coverage ({coverage[0].date()}.."
+                      f"{coverage[1].date()}, {len(uncovered)} uncovered "
+                      f"markets) and stay NaN (ineligible)")
     panel = pd.concat([pmp, ka_prices], ignore_index=True)
     panel = panel.merge(meta[["market_id"]], on="market_id", how="inner")
     panel = panel.sort_values(["market_id", "date"]).reset_index(drop=True)
@@ -101,6 +120,7 @@ def main() -> None:
         pd.read_parquet(raw / "kalshi" / "prices.parquet"),
         pm_volumes,
         volume_coverage(raw),
+        uncovered_markets(raw),
     )
     meta.to_parquet(out / "meta.parquet", index=False)
     panel.to_parquet(out / "panel.parquet", index=False)

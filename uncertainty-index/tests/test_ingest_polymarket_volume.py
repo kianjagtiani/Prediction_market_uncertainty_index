@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from uindex import config, normalize
+from uindex.ingest import kalshi
 from uindex.ingest import polymarket_volume as pv
 from uindex.ingest.polymarket_volume import TokenMapStore, VolumeStore
 
@@ -437,6 +438,75 @@ def test_build_panel_without_coverage_zero_fills_nothing(capsys):
     pm = panel[panel["market_id"] == "pm_1"].set_index("date")
     assert pd.isna(pm.loc[pd.Timestamp("2024-02-02"), "daily_notional_usd"])
     assert "WARNING" in capsys.readouterr().out
+
+
+def test_venue_notional_definitions_differ_and_are_pinned():
+    """The two venues' daily_notional_usd are built differently and a single
+    eligibility floor is applied to both. Pin each construction so a change
+    to either has to be a deliberate one.
+
+    Kalshi: contracts x price, one leg per market.
+    Polymarket: the USDC collateral leg of CLOB fills, summed over BOTH
+    outcome tokens of the market.
+    """
+    ka = kalshi.candles_to_df({"candlesticks": [{
+        "end_period_ts": 1709251200, "volume_fp": "1000.00",
+        "price": {"close_dollars": "0.60"},
+    }]}, "ka_1")
+    assert ka.loc[0, "daily_notional_usd"] == pytest.approx(600.0)
+
+
+def test_pm_notional_sums_both_outcome_tokens_of_a_market(tmp_path):
+    """The other half of the definition: $600 of collateral recorded against
+    each of a market's two tokens becomes $1200 for the market. If matched
+    YES/NO fills are booked on both orderbooks, PM is ~2x Kalshi for the
+    same economic activity under a shared eligibility floor — an open
+    reconciliation that volumes_coverage.csv exists to settle."""
+    d = pd.Timestamp("2024-03-01")
+    pd.DataFrame({"token_id": ["11", "12"], "date": [d, d],
+                  "notional_usd": [600.0, 600.0]}
+                 ).to_parquet(tmp_path / "volumes_by_token.parquet",
+                              index=False)
+    pd.DataFrame({"token_id": ["11", "12"],
+                  "market_id": ["pm_1", "pm_1"]}
+                 ).to_parquet(tmp_path / "token_map.parquet", index=False)
+    pv.assemble(tmp_path)
+    vol = pd.read_parquet(tmp_path / "volumes.parquet")
+    assert vol.loc[0, "daily_notional_usd"] == pytest.approx(1200.0)
+
+
+def test_coverage_report_flags_markets_the_subgraph_does_not_index(tmp_path):
+    """negRisk and legacy AMM fills are not in this subgraph (pm_559700: $0
+    swept vs $85k Gamma). Without the report, normalize's zero-fill reads
+    that as "genuinely zero notional" and the market silently disappears."""
+    pm_dir = tmp_path / "polymarket"
+    pm_dir.mkdir()
+    pd.DataFrame({
+        "market_id": ["pm_ok", "pm_ok", "pm_negrisk"],
+        "date": pd.to_datetime(["2024-03-01", "2024-03-02", "2024-03-01"]),
+        "daily_notional_usd": [60_000.0, 36_000.0, 10.0],
+    }).to_parquet(pm_dir / "volumes.parquet", index=False)
+    pd.DataFrame({
+        "market_id": ["pm_ok", "pm_negrisk", "pm_missing"],
+        "total_volume_usd": [100_000.0, 85_005.0, 50_000.0],
+    }).to_parquet(pm_dir / "markets.parquet", index=False)
+
+    pv.write_coverage_report(pm_dir)
+    rep = pd.read_csv(pm_dir / "volumes_coverage.csv").set_index("market_id")
+    assert rep.loc["pm_ok", "coverage"] == pytest.approx(0.96)
+    assert bool(rep.loc["pm_ok", "covered"])
+    assert not bool(rep.loc["pm_negrisk", "covered"])
+    assert rep.loc["pm_missing", "subgraph_notional_usd"] == 0.0
+    assert not bool(rep.loc["pm_missing", "covered"])
+    assert normalize.uncovered_markets(tmp_path) == {"pm_negrisk", "pm_missing"}
+
+
+def test_uncovered_markets_are_never_zero_filled():
+    _, panel, _ = normalize.build_panel(
+        *_panel_inputs(), _PM_VOLUMES, _FULL_COVERAGE, {"pm_1"})
+    pm = panel[panel["market_id"] == "pm_1"].set_index("date")
+    assert pm.loc[pd.Timestamp("2024-02-01"), "daily_notional_usd"] == 321.5
+    assert pd.isna(pm.loc[pd.Timestamp("2024-02-02"), "daily_notional_usd"])
 
 
 def test_volume_coverage_reads_the_sweep_manifest(tmp_path):
