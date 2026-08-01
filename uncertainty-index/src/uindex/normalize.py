@@ -1,4 +1,7 @@
 """Unify venue data into one schema; apply taxonomy; drop sports/unmapped."""
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -21,9 +24,24 @@ def categorize(question: str, venue_category: str) -> str:
     return config.VENUE_CATEGORY_MAP.get(vcat, "UNMAPPED")
 
 
+def volume_coverage(raw_dir) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """The (first, last) day the Goldsky sweep actually covered, or None.
+
+    Written by VolumeStore.finalize. Absent, or present with null bounds,
+    means nothing may be zero-filled."""
+    path = Path(raw_dir) / "polymarket" / "volumes_manifest.json"
+    if not path.exists():
+        return None
+    m = json.loads(path.read_text())
+    if not m.get("first_date") or not m.get("last_date"):
+        return None
+    return pd.Timestamp(m["first_date"]), pd.Timestamp(m["last_date"])
+
+
 def build_panel(pm_meta: pd.DataFrame, pm_prices: pd.DataFrame,
                 ka_meta: pd.DataFrame, ka_prices: pd.DataFrame,
-                pm_volumes: pd.DataFrame | None = None
+                pm_volumes: pd.DataFrame | None = None,
+                coverage: tuple[pd.Timestamp, pd.Timestamp] | None = None
                 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     pm = pm_meta.copy()
     pm["event_ticker"] = np.nan
@@ -42,9 +60,23 @@ def build_panel(pm_meta: pd.DataFrame, pm_prices: pd.DataFrame,
         pmp = pmp.merge(
             pm_volumes[["market_id", "date", "daily_notional_usd"]],
             on=["market_id", "date"], how="left")
-        # PM rows only: an active market-day with no fills is genuinely
-        # zero notional (Kalshi rows keep their own candle notional).
-        pmp["daily_notional_usd"] = pmp["daily_notional_usd"].fillna(0.0)
+        # "No fills" only means "$0 traded" where the sweep actually looked.
+        # Outside its manifest range the value stays NaN, which the universe
+        # already treats as ineligible rather than as a market that fell
+        # below the liquidity floor. A truncated sweep therefore shrinks the
+        # universe visibly instead of silently zeroing out Polymarket.
+        if coverage is None:
+            print("WARNING: no volumes_manifest.json - PM market-days with "
+                  "no fills stay NaN (ineligible), not $0")
+        else:
+            inside = pmp["date"].between(*coverage)
+            pmp.loc[inside, "daily_notional_usd"] = (
+                pmp.loc[inside, "daily_notional_usd"].fillna(0.0))
+            outside = int((~inside).sum())
+            if outside:
+                print(f"normalize: {outside} PM market-days fall outside the "
+                      f"volume sweep's coverage {coverage[0].date()}..."
+                      f"{coverage[1].date()} and stay NaN (ineligible)")
     panel = pd.concat([pmp, ka_prices], ignore_index=True)
     panel = panel.merge(meta[["market_id"]], on="market_id", how="inner")
     panel = panel.sort_values(["market_id", "date"]).reset_index(drop=True)
@@ -68,6 +100,7 @@ def main() -> None:
         pd.read_parquet(raw / "kalshi" / "markets.parquet"),
         pd.read_parquet(raw / "kalshi" / "prices.parquet"),
         pm_volumes,
+        volume_coverage(raw),
     )
     meta.to_parquet(out / "meta.parquet", index=False)
     panel.to_parquet(out / "panel.parquet", index=False)

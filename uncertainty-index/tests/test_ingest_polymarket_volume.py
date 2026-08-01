@@ -76,12 +76,20 @@ def _no_sleep(monkeypatch):
     monkeypatch.setattr(pv.time, "sleep", lambda s: None)
 
 
+def _relax_completion_guards(monkeypatch):
+    """These fixtures sweep a handful of 2024 fills, so the production
+    "did the sweep reach the present" guards are exercised separately."""
+    monkeypatch.setattr(config, "GOLDSKY_MIN_FILLS", 0)
+    monkeypatch.setattr(config, "GOLDSKY_MAX_CURSOR_LAG_S", 10 ** 12)
+
+
 def test_notional_is_size_over_1e6_pinned_to_live_reconciliation(
         monkeypatch, tmp_path):
     # Live probe: sum(size) over all 243 fills of one token == the
     # subgraph's own orderbook.collateralVolume == 591728611, and
     # scaledCollateralVolume == 591.728611. So USD = size / 1e6, no price.
     _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
     sizes = [591728611 - 39600000, 39600000]  # split of the verified total
     fills = [_fill(START_TS + i, f"0xf{i}", "7", s)
              for i, s in enumerate(sizes)]
@@ -96,6 +104,7 @@ def test_notional_is_size_over_1e6_pinned_to_live_reconciliation(
 def test_sweep_cursor_resumes_across_portions_without_double_count(
         monkeypatch, tmp_path):
     _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
     monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 2)
     # Two fills share a timestamp so resume exercises the id tie-break.
     fills = [_fill(START_TS, "0xa", "1", 1_000_000),
@@ -122,6 +131,7 @@ def test_flush_boundary_same_token_day_rows_are_summed(monkeypatch, tmp_path):
     # One (token, day)'s fills landing in different flush shards must SUM
     # in the merge; first-occurrence dedup would silently drop notional.
     _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
     monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 1)
     monkeypatch.setattr(pv, "FLUSH_PAGES", 1)
     fills = [_fill(START_TS, "0xa", "1", 3_000_000),
@@ -137,6 +147,7 @@ def test_resume_prunes_uncommitted_flush_shards(monkeypatch, tmp_path):
     # Crash between shard write and cursor write: the replayed pages would
     # double-count the orphan shard's sums, so resume() must delete it.
     _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
     monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 1)
     fills = [_fill(START_TS, "0xa", "1", 1_000_000)]
     store = VolumeStore(tmp_path)
@@ -153,6 +164,7 @@ def test_resume_prunes_uncommitted_flush_shards(monkeypatch, tmp_path):
 def test_page_size_halves_on_statement_timeout(monkeypatch, tmp_path):
     # Live: 1000-row nested-join pages deterministically time out; 500 ok.
     _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
     monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 400)
     monkeypatch.setattr(pv, "MIN_PAGE_SIZE", 100)
     fills = [_fill(START_TS + i, f"0x{i:02d}", "1", 1_000_000)
@@ -168,15 +180,79 @@ def test_page_size_halves_on_statement_timeout(monkeypatch, tmp_path):
 
 def test_page_size_raises_at_floor(monkeypatch, tmp_path):
     _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
     monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 200)
     client = _FakeGoldsky([], fail_above=0)
     with pytest.raises(pv.GoldskyQueryError):
         pv.sweep(client, VolumeStore(tmp_path))
 
 
+class _ShortPageOnce(_FakeGoldsky):
+    """A degraded store returns one truncated page mid-sweep, then recovers.
+    The module's own docstring records that this endpoint fails
+    non-deterministically under load."""
+
+    def _fills_page(self, var):
+        first = var["first"]
+        if not self.calls[:-1]:  # truncate the very first page only
+            var = {**var, "first": max(first // 3, 1)}
+        return super()._fills_page(var)
+
+
+def test_short_page_does_not_end_the_sweep(monkeypatch, tmp_path):
+    _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 6)
+    fills = [_fill(START_TS + i * 86400, f"0x{i:02d}", "1", 1_000_000)
+             for i in range(20)]
+    store = VolumeStore(tmp_path)
+    assert pv.sweep(_ShortPageOnce(fills), store) is True
+    df = pd.read_parquet(store.final_path)
+    assert df["notional_usd"].sum() == pytest.approx(20.0)  # nothing lost
+    assert len(df) == 20
+
+
+def test_stale_cursor_refuses_to_finalize(monkeypatch, tmp_path):
+    """An empty page while the cursor is still months behind means the
+    remaining history is missing, not absent."""
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_MIN_FILLS", 0)
+    fills = [_fill(START_TS, "0xa", "1", 1_000_000)]
+    store = VolumeStore(tmp_path)
+    with pytest.raises(pv.SweepIncompleteError, match="days behind"):
+        pv.sweep(_FakeGoldsky(fills), store)
+    assert not store.complete
+    assert (tmp_path / "volumes_cursor.json").exists()  # resumable
+
+
+def test_too_few_fills_refuses_to_finalize(monkeypatch, tmp_path):
+    """The degenerate case: the very first request returns nothing, which
+    used to write an empty volumes.parquet and delete Polymarket."""
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_MIN_FILLS", 10)
+    store = VolumeStore(tmp_path)
+    with pytest.raises(pv.SweepIncompleteError, match="only 0 fills"):
+        pv.sweep(_FakeGoldsky([]), store)
+    assert not store.complete
+
+
+def test_finalize_writes_a_coverage_manifest(monkeypatch, tmp_path):
+    _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
+    fills = [_fill(START_TS, "0xa", "1", 1_000_000),
+             _fill(START_TS + 5 * 86400, "0xb", "2", 2_000_000)]
+    store = VolumeStore(tmp_path)
+    assert pv.sweep(_FakeGoldsky(fills), store) is True
+    m = json.loads(store.manifest_path.read_text())
+    assert m == {"first_date": "2024-01-01T00:00:00",
+                 "last_date": "2024-01-06T00:00:00",
+                 "n_fills": 2, "n_tokens": 2}
+
+
 def test_build_token_map_pairs_tokens_and_keeps_unknown_yes(
         monkeypatch, tmp_path):
     _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
     meta = pd.DataFrame({"market_id": ["pm_1", "pm_2"],
                          "yes_token_id": ["11", "21"]})
     # Goldsky knows pm_1's condition (yes 11, sibling 12) but not pm_2.
@@ -190,6 +266,7 @@ def test_build_token_map_pairs_tokens_and_keeps_unknown_yes(
 
 def test_build_token_map_resumes_from_position(monkeypatch, tmp_path):
     _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
     monkeypatch.setattr(pv, "TOKEN_MAP_CHUNK", 1)
     meta = pd.DataFrame({"market_id": ["pm_1", "pm_2"],
                          "yes_token_id": ["11", "21"]})
@@ -248,18 +325,55 @@ def _panel_inputs():
     return pm_meta, pm_prices, ka_meta, ka_prices
 
 
+_PM_VOLUMES = pd.DataFrame({
+    "market_id": ["pm_1"], "date": pd.to_datetime(["2024-02-01"]),
+    "daily_notional_usd": [321.5],
+})
+_FULL_COVERAGE = (pd.Timestamp("2024-01-01"), pd.Timestamp("2024-06-01"))
+
+
 def test_build_panel_merges_pm_volumes_with_zero_fill_for_pm_only():
-    pm_volumes = pd.DataFrame({
-        "market_id": ["pm_1"], "date": pd.to_datetime(["2024-02-01"]),
-        "daily_notional_usd": [321.5],
-    })
-    _, panel, _ = normalize.build_panel(*_panel_inputs(), pm_volumes)
+    _, panel, _ = normalize.build_panel(*_panel_inputs(), _PM_VOLUMES,
+                                        _FULL_COVERAGE)
     pm = panel[panel["market_id"] == "pm_1"].set_index("date")
     assert pm.loc[pd.Timestamp("2024-02-01"), "daily_notional_usd"] == 321.5
-    # Active PM day with no fills is genuinely zero notional, not missing.
+    # Inside the sweep's coverage, a PM day with no fills is genuinely zero.
     assert pm.loc[pd.Timestamp("2024-02-02"), "daily_notional_usd"] == 0.0
     ka = panel[panel["market_id"] == "ka_X"]
     assert (ka["daily_notional_usd"] == 1500.0).all()  # Kalshi untouched
+
+
+def test_build_panel_keeps_uncovered_days_nan_not_zero():
+    """A truncated sweep must shrink the universe visibly, not silently
+    report every un-swept market-day as "$0 traded"."""
+    _, panel, _ = normalize.build_panel(
+        *_panel_inputs(), _PM_VOLUMES,
+        (pd.Timestamp("2024-01-01"), pd.Timestamp("2024-02-01")))
+    pm = panel[panel["market_id"] == "pm_1"].set_index("date")
+    assert pm.loc[pd.Timestamp("2024-02-01"), "daily_notional_usd"] == 321.5
+    assert pd.isna(pm.loc[pd.Timestamp("2024-02-02"), "daily_notional_usd"])
+
+
+def test_build_panel_without_coverage_zero_fills_nothing(capsys):
+    _, panel, _ = normalize.build_panel(*_panel_inputs(), _PM_VOLUMES)
+    pm = panel[panel["market_id"] == "pm_1"].set_index("date")
+    assert pd.isna(pm.loc[pd.Timestamp("2024-02-02"), "daily_notional_usd"])
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_volume_coverage_reads_the_sweep_manifest(tmp_path):
+    pm_dir = tmp_path / "polymarket"
+    pm_dir.mkdir()
+    assert normalize.volume_coverage(tmp_path) is None
+    manifest = pm_dir / "volumes_manifest.json"
+    manifest.write_text(json.dumps({"first_date": None, "last_date": None,
+                                    "n_fills": 0, "n_tokens": 0}))
+    assert normalize.volume_coverage(tmp_path) is None  # empty sweep
+    manifest.write_text(json.dumps({"first_date": "2024-01-01T00:00:00",
+                                    "last_date": "2025-03-04T00:00:00",
+                                    "n_fills": 5, "n_tokens": 2}))
+    assert normalize.volume_coverage(tmp_path) == (
+        pd.Timestamp("2024-01-01"), pd.Timestamp("2025-03-04"))
 
 
 def test_build_panel_without_volumes_keeps_pm_nan():

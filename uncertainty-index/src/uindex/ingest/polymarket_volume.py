@@ -77,6 +77,13 @@ class GoldskyQueryError(RuntimeError):
     pass
 
 
+class SweepIncompleteError(RuntimeError):
+    """The sweep ran out of rows without reaching the present. Raised rather
+    than finalized, because a finalized partial sweep is indistinguishable
+    on disk from a complete one and normalize would read its missing days as
+    "$0 traded"."""
+
+
 def _post(client: httpx.Client, query: str, variables: dict) -> dict:
     r = client.post(config.GOLDSKY_URL,
                     json={"query": query, "variables": variables})
@@ -102,6 +109,12 @@ def _fetch_fills(client: httpx.Client, where: dict,
             size = max(size // 2, MIN_PAGE_SIZE)
 
 
+def _write_json(path: Path, payload: dict) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload))
+    os.replace(tmp, path)
+
+
 def _where(cursor: dict | None) -> dict:
     if cursor is None:
         start = int(datetime.fromisoformat(config.BACKFILL_START)
@@ -123,6 +136,7 @@ class VolumeStore:
         self.final_path = out_dir / "volumes_by_token.parquet"
         self.parts_dir = out_dir / "volumes_parts"
         self.state_path = out_dir / "volumes_cursor.json"
+        self.manifest_path = out_dir / "volumes_manifest.json"
 
     @property
     def complete(self) -> bool:
@@ -155,15 +169,20 @@ class VolumeStore:
                 tmp = part.with_name(part.name + ".tmp")
                 grp.to_parquet(tmp, index=False)
                 os.replace(tmp, part)
-        tmp = self.state_path.with_name(self.state_path.name + ".tmp")
-        tmp.write_text(json.dumps({"cursor": cursor, "seq": seq, "n": n}))
-        os.replace(tmp, self.state_path)
+        _write_json(self.state_path, {"cursor": cursor, "seq": seq, "n": n})
 
-    def finalize(self) -> None:
+    def finalize(self, n_fills: int) -> None:
+        """Merge the shards and record what the sweep actually covered.
+
+        The manifest is the only thing downstream can use to tell a complete
+        sweep from a truncated one: normalize refuses to read "no fills" as
+        "$0 traded" outside [first_date, last_date]."""
         writer = None
         tmp = self.final_path.with_name(self.final_path.name + ".tmp")
         bdirs = (sorted(self.parts_dir.glob("b*"))
                  if self.parts_dir.exists() else [])
+        days: list[pd.Timestamp] = []
+        n_tokens = 0
         try:
             for bdir in bdirs:
                 files = sorted(bdir.glob("flush-*.parquet"))
@@ -175,6 +194,10 @@ class VolumeStore:
                 # duplicates — first-occurrence dedup would drop notional.
                 df = (df.groupby(["token_id", "date"], as_index=False)
                         ["notional_usd"].sum())
+                # Buckets partition on token id, so per-bucket distinct
+                # counts add up and the day bounds are a running min/max.
+                n_tokens += df["token_id"].nunique()
+                days += [df["date"].min(), df["date"].max()]
                 table = pa.Table.from_pandas(df, preserve_index=False)
                 if writer is None:
                     writer = pq.ParquetWriter(tmp, table.schema)
@@ -189,6 +212,12 @@ class VolumeStore:
                           "date": pd.Series(dtype="datetime64[ns]"),
                           "notional_usd": pd.Series(dtype="float64")}
                          ).to_parquet(self.final_path, index=False)
+        _write_json(self.manifest_path, {
+            "first_date": min(days).isoformat() if days else None,
+            "last_date": max(days).isoformat() if days else None,
+            "n_fills": n_fills,
+            "n_tokens": n_tokens,
+        })
         # State first, like MetaStore: a stale cursor must not survive.
         self.state_path.unlink(missing_ok=True)
         for bdir in bdirs:
@@ -199,9 +228,35 @@ class VolumeStore:
             self.parts_dir.rmdir()
 
 
+def _check_exhausted(cursor: dict | None, n_fills: int) -> None:
+    """A sweep is only complete if it swept a plausible number of fills AND
+    its cursor reached the present. Anything else finalizes a partial
+    history that normalize would launder into "$0 traded"."""
+    if n_fills < config.GOLDSKY_MIN_FILLS:
+        raise SweepIncompleteError(
+            f"sweep returned an empty page after only {n_fills} fills "
+            f"(expected >= {config.GOLDSKY_MIN_FILLS}); the subgraph is "
+            f"degraded or lagging. Cursor kept — rerun to resume.")
+    lag = time.time() - int(cursor["ts"])
+    if lag > config.GOLDSKY_MAX_CURSOR_LAG_S:
+        raise SweepIncompleteError(
+            f"sweep returned an empty page {lag / 86400:.1f} days behind "
+            f"now (limit {config.GOLDSKY_MAX_CURSOR_LAG_S / 3600:.0f}h); the "
+            f"remaining history is missing, not absent. Cursor kept.")
+
+
 def sweep(client: httpx.Client, store: VolumeStore,
           max_pages: int | None = None) -> bool:
-    """Advance the global fill sweep by up to max_pages; True on exhausted."""
+    """Advance the global fill sweep by up to max_pages; True on exhausted.
+
+    Exhaustion means an EMPTY page, not a short one. The subgraph fails
+    non-deterministically under load (see module docstring), and a short
+    page from a degraded store used to finalize the sweep, unlink the
+    cursor and leave `complete` permanently True with 30% of the history —
+    at which point normalize's fillna(0.0) turns the rest into "$0 traded"
+    and Polymarket silently drops out of the index. One extra request per
+    sweep is the price of not being able to confuse the two.
+    """
     cursor, seq, n = store.resume()
     size = config.GOLDSKY_PAGE_SIZE
     acc: dict[tuple[str, int], float] = {}
@@ -215,7 +270,7 @@ def sweep(client: httpx.Client, store: VolumeStore,
         if rows:
             cursor = {"ts": rows[-1]["timestamp"], "id": rows[-1]["id"]}
         pages += 1
-        done = len(rows) < size
+        done = not rows
         if done or pages % FLUSH_PAGES == 0:
             seq += 1
             store.commit(acc, cursor, seq, n)
@@ -223,7 +278,8 @@ def sweep(client: httpx.Client, store: VolumeStore,
             print(f"  volume sweep: {n} fills through "
                   f"{cursor['ts'] if cursor else 'start'}", flush=True)
         if done:
-            store.finalize()
+            _check_exhausted(cursor, n)
+            store.finalize(n)
             return True
         time.sleep(config.GOLDSKY_SLEEP_S)
     seq += 1

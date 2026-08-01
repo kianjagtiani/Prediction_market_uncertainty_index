@@ -49,6 +49,14 @@ GOLDSKY_URL = ("https://api.goldsky.com/api/public/"
                "polymarket-orderbook-resync/prod/gn")
 GOLDSKY_PAGE_SIZE = 1000
 GOLDSKY_SLEEP_S = 0.2
+# Sweep-completion guards. The sweep is only "exhausted" when a page comes
+# back empty AND the cursor has caught up to roughly now; a degraded store,
+# a rate-limit truncation or a reindexing lag otherwise finalizes a partial
+# sweep that is indistinguishable from a complete one on disk. The lag bound
+# is generous (Polymarket fills are near-continuous, so a genuinely complete
+# sweep lands within seconds) but a truncated one is days or months behind.
+GOLDSKY_MAX_CURSOR_LAG_S = 6 * 3600
+GOLDSKY_MIN_FILLS = 100_000
 
 INDEXES = ["GLOBAL", "WAR", "ELECTIONS", "POLITICS", "ECON_FED",
            "CRYPTO", "TECH_AI", "CLIMATE"]
