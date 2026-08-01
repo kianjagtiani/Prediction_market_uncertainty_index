@@ -77,6 +77,7 @@ def test_repricing_dominates_on_stable_membership_day(daily):
     assert row["repricing"] == pytest.approx(row["delta_raw"])
 
 
-def test_membership_share_bounded(daily):
-    share = churn.membership_share(daily)
-    assert 0.0 <= share <= 1.0
+def test_shares_are_bounded(daily):
+    s = churn.shares(daily)
+    assert set(s) == set(churn.COMPONENTS)
+    assert all(0.0 <= v <= 1.0 for v in s.values())

@@ -20,6 +20,8 @@ import pandas as pd
 
 from .. import compute, config, universe
 
+COMPONENTS = ["repricing", "reweighting", "membership"]
+
 
 def _wmean_rows(vals: pd.DataFrame, weights: pd.DataFrame,
                 mask: pd.DataFrame) -> pd.Series:
@@ -65,19 +67,11 @@ def decompose(flagged: pd.DataFrame,
     return out.dropna(subset=["delta_raw"])
 
 
-COMPONENTS = ["repricing", "reweighting", "membership"]
-
-
 def shares(daily: pd.DataFrame) -> dict[str, float]:
     """Each component's share of total |delta_raw|."""
     total = daily["delta_raw"].abs().sum()
     return {c: float(daily[c].abs().sum() / total) if total else float("nan")
             for c in COMPONENTS}
-
-
-def membership_share(daily: pd.DataFrame) -> float:
-    """Membership share of total |delta_raw| (guideline <= 0.20)."""
-    return shares(daily)["membership"]
 
 
 def main() -> None:
