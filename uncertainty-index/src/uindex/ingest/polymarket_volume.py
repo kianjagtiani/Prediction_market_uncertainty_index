@@ -34,7 +34,9 @@ drives it unmodified.
 """
 import json
 import os
+import shutil
 import time
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -52,6 +54,8 @@ BUCKETS = 16         # final sum-merge holds one bucket in RAM, never the sweep
 FLUSH_PAGES = 500    # pages aggregated in RAM between shard commits
 MIN_PAGE_SIZE = 100  # verified fast; a timeout below this is a real outage
 TOKEN_MAP_CHUNK = 200
+MAX_MARKETS_WAITS = 10  # 60s polls for markets.parquet before giving up
+ASSEMBLE_BATCH_ROWS = 65_536  # rows held in RAM per assemble pass-1 batch
 
 FILLS_QUERY = """query($first: Int!, $where: EnrichedOrderFilled_filter) {
   enrichedOrderFilleds(first: $first, orderBy: timestamp,
@@ -287,6 +291,17 @@ def sweep(client: httpx.Client, store: VolumeStore,
     return False
 
 
+def _catalog_fingerprint(meta: pd.DataFrame) -> dict:
+    """Identity of the sorted markets.parquet the cursor position indexes
+    into. `pos` is a row offset, and markets.parquet is re-crawled from zero
+    as a documented workflow and os.replace'd by the metadata finalize while
+    this runs; without a binding, a resumed run starts at `pos` in a
+    different catalog and silently never maps the markets before it."""
+    return {"n_markets": int(len(meta)),
+            "last_market_id": (str(meta["market_id"].iloc[-1])
+                               if len(meta) else None)}
+
+
 class TokenMapStore:
     """Checkpointed token -> market_id enrichment. Mapping rows are
     idempotent facts (unlike volume sums), so replayed chunks after a crash
@@ -301,17 +316,25 @@ class TokenMapStore:
     def complete(self) -> bool:
         return self.final_path.exists()
 
-    def resume(self) -> int:
-        if self.state_path.exists():
-            return json.loads(self.state_path.read_text())["pos"]
+    def resume(self, fingerprint: dict) -> int:
+        if not self.state_path.exists():
+            return 0
+        state = json.loads(self.state_path.read_text())
+        if all(state.get(k) == v for k, v in fingerprint.items()):
+            return state["pos"]
+        print(f"  token map: markets.parquet changed under the cursor "
+              f"(was {state.get('n_markets')} markets ending "
+              f"{state.get('last_market_id')}, now {fingerprint}); "
+              f"restarting from zero", flush=True)
+        for p in self.parts_dir.glob("part-*.parquet"):
+            p.unlink()
+        self.state_path.unlink()
         return 0
 
-    def commit(self, df: pd.DataFrame, pos: int) -> None:
+    def commit(self, df: pd.DataFrame, pos: int, fingerprint: dict) -> None:
         if not df.empty:
             _write_part(df, self.parts_dir)
-        tmp = self.state_path.with_name(self.state_path.name + ".tmp")
-        tmp.write_text(json.dumps({"pos": pos}))
-        os.replace(tmp, self.state_path)
+        _write_json(self.state_path, {"pos": pos, **fingerprint})
 
     def finalize(self) -> None:
         parts = (sorted(self.parts_dir.glob("part-*.parquet"))
@@ -335,14 +358,25 @@ class TokenMapStore:
 def build_token_map(client: httpx.Client, store: TokenMapStore,
                     meta: pd.DataFrame) -> None:
     meta = meta.sort_values("market_id").reset_index(drop=True)
-    pos = store.resume()
+    fingerprint = _catalog_fingerprint(meta)
+    pos = store.resume(fingerprint)
     while pos < len(meta):
-        chunk = meta.iloc[pos:pos + TOKEN_MAP_CHUNK]
+        raw = meta.iloc[pos:pos + TOKEN_MAP_CHUNK]
+        # A missing yes_token_id becomes a NaN dict key and a repeated one
+        # silently collapses two markets into one; count both instead.
+        chunk = raw.dropna(subset=["yes_token_id"]).drop_duplicates(
+            "yes_token_id")
+        if len(chunk) < len(raw):
+            print(f"  token map: {len(raw) - len(chunk)}/{len(raw)} markets "
+                  f"in this chunk have a missing or repeated yes_token_id "
+                  f"and stay unmapped", flush=True)
         by_yes = dict(zip(chunk["yes_token_id"], chunk["market_id"]))
-        data = _post(client, CONDITIONS_QUERY, {"ids": list(by_yes)})
-        cond_to_mkt = {md["condition"]["id"]: by_yes[md["id"]]
-                       for md in data["marketDatas"] if md.get("condition")}
-        time.sleep(config.GOLDSKY_SLEEP_S)
+        cond_to_mkt = {}
+        if by_yes:
+            data = _post(client, CONDITIONS_QUERY, {"ids": list(by_yes)})
+            cond_to_mkt = {md["condition"]["id"]: by_yes[md["id"]]
+                           for md in data["marketDatas"] if md.get("condition")}
+            time.sleep(config.GOLDSKY_SLEEP_S)
         # Yes tokens map exactly from our own metadata even where Goldsky
         # has no marketData entity; siblings extend the map where it does.
         rows = dict(by_yes)
@@ -351,42 +385,104 @@ def build_token_map(client: httpx.Client, store: TokenMapStore,
             for md in data["marketDatas"]:
                 rows[md["id"]] = cond_to_mkt[md["condition"]["id"]]
             time.sleep(config.GOLDSKY_SLEEP_S)
-        pos += len(chunk)
+        pos += len(raw)
         store.commit(pd.DataFrame({"token_id": list(rows),
-                                   "market_id": list(rows.values())}), pos)
+                                   "market_id": list(rows.values())}),
+                     pos, fingerprint)
         print(f"  token map: {pos}/{len(meta)} markets", flush=True)
     store.finalize()
 
 
+def _bucket(key: str) -> int:
+    """Stable bucket for an arbitrary id string. crc32, not int(), so a
+    non-decimal id cannot raise mid-accumulation."""
+    return zlib.crc32(str(key).encode()) % BUCKETS
+
+
 def assemble(out_dir: Path) -> None:
     """volumes_by_token + token_map -> volumes.parquet (market_id, date,
-    daily_notional_usd), both outcome tokens summed per market-day."""
+    daily_notional_usd), both outcome tokens summed per market-day.
+
+    Two passes over disk, bucketed by market_id, so peak RAM is one bucket.
+    The single-pass version accumulated every batch's aggregate in a list
+    and concatenated at the end; on an 8 GB machine that is a plausible
+    2 GB watchdog kill, and a kill here exits 143, which the driver reads
+    as progress — relaunch, both stores still complete, assemble again,
+    killed again, forever with no output and no failure signal.
+
+    Rows come out grouped by bucket rather than globally sorted by
+    market_id. Deterministic, just not lexicographic.
+    """
     token_map = pd.read_parquet(out_dir / "token_map.parquet")
     tok_to_mkt = dict(zip(token_map["token_id"], token_map["market_id"]))
+    parts_dir = out_dir / "assemble_parts"
+    shutil.rmtree(parts_dir, ignore_errors=True)
+
     pf = pq.ParquetFile(out_dir / "volumes_by_token.parquet")
-    frames = []
-    for batch in pf.iter_batches(65536):
+    for i, batch in enumerate(pf.iter_batches(ASSEMBLE_BATCH_ROWS)):
         df = batch.to_pandas()
         df["market_id"] = df["token_id"].map(tok_to_mkt)
         df = df.dropna(subset=["market_id"])
-        if not df.empty:
-            frames.append(df.groupby(["market_id", "date"], as_index=False)
-                            ["notional_usd"].sum())
-    vol = (pd.concat(frames, ignore_index=True)
-             .groupby(["market_id", "date"], as_index=False)
-             ["notional_usd"].sum()
-           if frames else
-           pd.DataFrame({"market_id": pd.Series(dtype=str),
-                         "date": pd.Series(dtype="datetime64[ns]"),
-                         "notional_usd": pd.Series(dtype="float64")}))
-    vol = vol.rename(columns={"notional_usd": "daily_notional_usd"})
-    vol["daily_notional_usd"] = vol["daily_notional_usd"].astype("float64")
-    vol = vol.sort_values(["market_id", "date"]).reset_index(drop=True)
+        if df.empty:
+            continue
+        df = (df.groupby(["market_id", "date"], as_index=False)
+                ["notional_usd"].sum())
+        for b, grp in df.groupby(df["market_id"].map(_bucket)):
+            bdir = parts_dir / f"b{b:02d}"
+            bdir.mkdir(parents=True, exist_ok=True)
+            grp.to_parquet(bdir / f"batch-{i:06d}.parquet", index=False)
+
     final = out_dir / "volumes.parquet"
     tmp = final.with_name(final.name + ".tmp")
-    vol.to_parquet(tmp, index=False)
-    os.replace(tmp, final)
-    print(f"volumes.parquet: {len(vol)} market-days")
+    writer, n_rows = None, 0
+    bdirs = sorted(parts_dir.glob("b*")) if parts_dir.exists() else []
+    try:
+        for bdir in bdirs:
+            df = pd.concat([pd.read_parquet(p)
+                            for p in sorted(bdir.glob("batch-*.parquet"))],
+                           ignore_index=True)
+            # A market's two outcome tokens can land in different token
+            # buckets and different batches: SUM across all of them.
+            df = (df.groupby(["market_id", "date"], as_index=False)
+                    ["notional_usd"].sum()
+                    .rename(columns={"notional_usd": "daily_notional_usd"})
+                    .sort_values(["market_id", "date"]))
+            df["daily_notional_usd"] = df["daily_notional_usd"].astype("float64")
+            n_rows += len(df)
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(tmp, table.schema)
+            writer.write_table(table.cast(writer.schema))
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is not None:
+        os.replace(tmp, final)
+    else:
+        pd.DataFrame({"market_id": pd.Series(dtype=str),
+                      "date": pd.Series(dtype="datetime64[ns]"),
+                      "daily_notional_usd": pd.Series(dtype="float64")}
+                     ).to_parquet(final, index=False)
+    shutil.rmtree(parts_dir, ignore_errors=True)
+    print(f"volumes.parquet: {n_rows} market-days")
+
+
+def _wait_for_markets(out_dir: Path) -> None:
+    """Poll gently for the metadata crawl, but not forever. Exit 3 resets
+    the driver's failure counter, so an unbounded wait spins one process a
+    minute indefinitely with no failure and no alert — e.g. when only the
+    `run_backfill.sh polymarket_volume` line was run."""
+    path = out_dir / "volume_wait.json"
+    waits = (json.loads(path.read_text())["waits"] + 1
+             if path.exists() else 1)
+    if waits > MAX_MARKETS_WAITS:
+        raise RuntimeError(
+            f"markets.parquet still absent after {MAX_MARKETS_WAITS} waits; "
+            f"run scripts/run_backfill.sh polymarket first")
+    _write_json(path, {"waits": waits})
+    print(f"waiting on markets.parquet for token mapping "
+          f"({waits}/{MAX_MARKETS_WAITS})", flush=True)
+    time.sleep(60)
 
 
 def main(pages: int | None = None) -> bool:
@@ -401,11 +497,9 @@ def main(pages: int | None = None) -> bool:
             sweep(client, vol, pages)
             return False  # mapping starts in a fresh process either way
         if not (OUT_DIR / "markets.parquet").exists():
-            # The metadata crawl (ingest.polymarket) hasn't finalized; poll
-            # gently instead of hot-looping the driver.
-            print("waiting on markets.parquet for token mapping")
-            time.sleep(60)
+            _wait_for_markets(OUT_DIR)
             return False
+        (OUT_DIR / "volume_wait.json").unlink(missing_ok=True)
         tmap = TokenMapStore(OUT_DIR)
         if not tmap.complete:
             meta = pd.read_parquet(OUT_DIR / "markets.parquet",

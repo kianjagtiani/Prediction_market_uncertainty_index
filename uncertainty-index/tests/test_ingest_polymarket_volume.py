@@ -271,13 +271,52 @@ def test_build_token_map_resumes_from_position(monkeypatch, tmp_path):
     meta = pd.DataFrame({"market_id": ["pm_1", "pm_2"],
                          "yes_token_id": ["11", "21"]})
     store = TokenMapStore(tmp_path)
-    store.commit(pd.DataFrame({"token_id": ["11"], "market_id": ["pm_1"]}), 1)
+    store.commit(pd.DataFrame({"token_id": ["11"], "market_id": ["pm_1"]}), 1,
+                 pv._catalog_fingerprint(meta))
     client = _FakeGoldsky(market_datas={})
     pv.build_token_map(client, store, meta)
     # Only the second market's chunk was fetched after resume.
     assert [c["variables"]["ids"] for c in client.calls] == [["21"]]
     tm = pd.read_parquet(store.final_path)
     assert set(tm["token_id"]) == {"11", "21"}
+
+
+def test_token_map_cursor_restarts_when_the_catalog_changed(
+        monkeypatch, tmp_path):
+    """`pos` is a row offset into a sorted markets.parquet that the
+    documented re-crawl workflow rebuilds from zero. Resuming at `pos` in a
+    different catalog silently never maps the markets before it."""
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(pv, "TOKEN_MAP_CHUNK", 1)
+    old = pd.DataFrame({"market_id": ["pm_1", "pm_2"],
+                        "yes_token_id": ["11", "21"]})
+    store = TokenMapStore(tmp_path)
+    store.commit(pd.DataFrame({"token_id": ["11"], "market_id": ["pm_1"]}), 1,
+                 pv._catalog_fingerprint(old))
+
+    recrawled = pd.DataFrame(
+        {"market_id": ["pm_0", "pm_1", "pm_2"],
+         "yes_token_id": ["01", "11", "21"]})
+    client = _FakeGoldsky(market_datas={})
+    pv.build_token_map(client, store, recrawled)
+    assert [c["variables"]["ids"] for c in client.calls] == [["01"], ["11"],
+                                                             ["21"]]
+    tm = pd.read_parquet(store.final_path)
+    assert set(tm["token_id"]) == {"01", "11", "21"}
+
+
+def test_token_map_skips_missing_and_repeated_yes_token_ids(
+        monkeypatch, tmp_path, capsys):
+    """A NaN yes_token_id becomes a NaN dict key; a repeated one collapses
+    two markets into whichever came last."""
+    _no_sleep(monkeypatch)
+    meta = pd.DataFrame({"market_id": ["pm_1", "pm_2", "pm_3"],
+                         "yes_token_id": ["11", None, "11"]})
+    store = TokenMapStore(tmp_path)
+    pv.build_token_map(_FakeGoldsky(market_datas={}), store, meta)
+    tm = pd.read_parquet(store.final_path)
+    assert tm.set_index("token_id")["market_id"].to_dict() == {"11": "pm_1"}
+    assert "stay unmapped" in capsys.readouterr().out
 
 
 def test_assemble_sums_both_tokens_and_drops_unmapped(tmp_path):
@@ -295,6 +334,45 @@ def test_assemble_sums_both_tokens_and_drops_unmapped(tmp_path):
     assert vol["daily_notional_usd"].dtype == "float64"
     assert vol.set_index("date")["daily_notional_usd"].to_dict() == {
         d: 15.0, d + pd.Timedelta(days=1): 2.0}  # token 99 unmapped -> out
+
+
+def test_assemble_streams_buckets_and_leaves_no_parts(monkeypatch, tmp_path):
+    """Pass 1 must never hold the whole panel: an unportioned assemble is a
+    plausible watchdog kill, and a kill exits 143 which the driver reads as
+    progress -> relaunch -> assemble -> kill, forever. Correctness across
+    both the batch and the bucket split is what the streaming has to keep."""
+    monkeypatch.setattr(pv, "ASSEMBLE_BATCH_ROWS", 2)
+    monkeypatch.setattr(pv, "BUCKETS", 3)
+    days = pd.date_range("2024-03-01", periods=3, freq="D")
+    rows = [{"token_id": tok, "date": d, "notional_usd": 1.0}
+            for tok in ("11", "12", "21", "22") for d in days]
+    pd.DataFrame(rows).to_parquet(tmp_path / "volumes_by_token.parquet",
+                                  index=False)
+    pd.DataFrame({"token_id": ["11", "12", "21", "22"],
+                  "market_id": ["pm_1", "pm_1", "pm_2", "pm_2"]}
+                 ).to_parquet(tmp_path / "token_map.parquet", index=False)
+    pv.assemble(tmp_path)
+    vol = pd.read_parquet(tmp_path / "volumes.parquet")
+    assert len(vol) == 6  # 2 markets x 3 days, both tokens summed
+    assert (vol["daily_notional_usd"] == 2.0).all()
+    assert not (tmp_path / "assemble_parts").exists()
+
+
+def test_waiting_on_markets_parquet_is_bounded(monkeypatch, tmp_path):
+    """Exit 3 resets the driver's failure counter, so an unbounded poll
+    spins one process a minute forever with no failure and no alert."""
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(pv, "OUT_DIR", tmp_path)
+    monkeypatch.setattr(pv, "MAX_MARKETS_WAITS", 2)
+    pd.DataFrame({"token_id": pd.Series(dtype=str),
+                  "date": pd.Series(dtype="datetime64[ns]"),
+                  "notional_usd": pd.Series(dtype="float64")}
+                 ).to_parquet(tmp_path / "volumes_by_token.parquet",
+                              index=False)
+    assert pv.main(pages=1) is False
+    assert pv.main(pages=1) is False
+    with pytest.raises(RuntimeError, match="markets.parquet still absent"):
+        pv.main(pages=1)
 
 
 def _panel_inputs():
