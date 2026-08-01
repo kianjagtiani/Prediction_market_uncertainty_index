@@ -33,11 +33,36 @@ def test_entropy_max_at_half_and_symmetric():
 
 def test_ewma_vol_spikes_on_shock():
     rng = np.random.default_rng(0)
-    innov = pd.Series(rng.normal(0, 0.02, 100))
+    idx = pd.date_range("2024-01-01", periods=100, freq="D")
+    innov = pd.Series(rng.normal(0, 0.02, 100), index=idx)
     innov.iloc[80] = 2.0
     vol = compute.ewma_vol(innov, halflife=10)
     assert vol.iloc[80] > 5 * vol.iloc[79]
     assert vol.iloc[:4].isna().all()  # min_periods respected
+
+
+def test_ewma_vol_decays_across_a_gap_in_calendar_days():
+    """A market leaves the universe for four months and comes back. The
+    stale volatility must have decayed by the elapsed DAYS, not by the one
+    observation that separates the two innovations in the series."""
+    quiet = pd.date_range("2024-01-01", periods=25, freq="D")
+    violent = pd.Series(0.8, index=quiet[:20])
+    calm = pd.Series(0.0, index=quiet[20:])
+    ret = pd.Series([0.0], index=[quiet[-1] + pd.Timedelta(days=120)])
+    innov = pd.concat([violent, calm, ret])
+    vol = compute.ewma_vol(innov, halflife=10)
+    assert vol.iloc[-2] > 0.3   # still hot the day before the market leaves
+    assert vol.iloc[-1] < 0.05  # 12 halflives of decay while it is away
+
+    # Same observations, gap closed: this is what an observation-counted
+    # ewm would have produced on the return day.
+    compacted = innov.set_axis(pd.date_range("2024-01-01", periods=len(innov)))
+    assert compute.ewma_vol(compacted, halflife=10).iloc[-1] > 10 * vol.iloc[-1]
+
+
+def test_ewma_vol_rejects_positional_index():
+    with pytest.raises(TypeError, match="DatetimeIndex"):
+        compute.ewma_vol(pd.Series([0.1, 0.2, 0.3]))
 
 
 def test_weighted_mean_ignores_nan_and_zero_weight():

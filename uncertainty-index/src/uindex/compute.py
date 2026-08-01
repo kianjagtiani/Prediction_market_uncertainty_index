@@ -24,10 +24,28 @@ def binary_entropy(p: np.ndarray, lo: float | None = None,
     return -(p * np.log2(p) + (1.0 - p) * np.log2(1.0 - p))
 
 
-def ewma_vol(innov: pd.Series, halflife: float = config.EWMA_HALFLIFE_DAYS) -> pd.Series:
+def ewma_vol(innov: pd.Series,
+             halflife: float = config.EWMA_HALFLIFE_DAYS) -> pd.Series:
+    """EWMA volatility of `innov`, decayed in CALENDAR DAYS.
+
+    `innov` must be indexed by date and is expected to be gappy: a market
+    leaves and re-enters the universe as its liquidity crosses the rolling
+    floor or as the pin rule bites, and only the observed innovations are
+    passed in. An observation-counted `ewm` would treat the pre-gap
+    innovations as one observation old on the day the market returns, so a
+    market that was violent before a three-month absence would re-enter
+    carrying its old volatility at full weight — on exactly the news days
+    that pull it back over the floor. `times=` decays by elapsed days
+    instead, so an absence costs the state its proper number of halflives.
+    """
+    if innov.empty:
+        return innov.astype(float)
+    if not isinstance(innov.index, pd.DatetimeIndex):
+        raise TypeError("ewma_vol needs a DatetimeIndex to decay in days")
     return (
         innov.pow(2)
-        .ewm(halflife=halflife, min_periods=config.EWMA_MIN_PERIODS)
+        .ewm(halflife=pd.Timedelta(days=halflife), times=innov.index,
+             min_periods=config.EWMA_MIN_PERIODS)
         .mean()
         .pow(0.5)
     )
