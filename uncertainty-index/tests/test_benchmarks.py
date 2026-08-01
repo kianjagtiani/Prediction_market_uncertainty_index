@@ -44,6 +44,20 @@ def test_noise_band_is_two_over_sqrt_n():
     assert stats["noise_band"] == pytest.approx(2 / np.sqrt(n))
 
 
+def test_lags_are_calendar_days_not_benchmark_observations():
+    """Weekday-only benchmark reacting with a true 5-CALENDAR-day lag. A
+    positional shift on the benchmark's own trading calendar reports -3
+    (three trading observations), which is not the unit the report prints."""
+    rng = np.random.default_rng(11)
+    dates = pd.date_range("2024-01-01", periods=400, freq="D")
+    ours = pd.Series(np.cumsum(rng.normal(0, 1, 400)), index=dates)
+    bench = ours.shift(5) + rng.normal(0, 0.05, 400)
+    bench = bench[bench.index.dayofweek < 5].dropna()
+    stats = benchmarks.corr_and_leadlag(ours, bench)
+    assert benchmarks.best_lag(stats["leadlag"]) == -5
+    assert stats["leads"]
+
+
 def test_diffs_taken_on_own_calendars():
     """Weekday-only bench: join-then-diff would fold our weekend moves into
     Monday and report corr 1.0; own-calendar diffs must not."""

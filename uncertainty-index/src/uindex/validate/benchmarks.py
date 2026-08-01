@@ -29,10 +29,21 @@ def corr_and_leadlag(index_series: pd.Series, bench: pd.Series,
                      max_lag: int = 10) -> dict:
     """Diff each series on its OWN calendar before aligning, so gaps in the
     benchmark calendar (weekends, holidays) cannot fold multi-day index moves
-    into one artificial shared observation."""
+    into one artificial shared observation.
+
+    Lags are CALENDAR DAYS. Both diff series are reindexed onto a common
+    daily calendar before shifting: VIX and GPR are weekday-only, so a
+    positional shift would silently mean one *trading* observation — three
+    calendar days across a weekend — while the report prints "best lag" as
+    days. Non-trading days stay NaN and drop out of each pair.
+    """
     joined = align(index_series, bench)
     d_idx = index_series.diff().dropna()
     d_bench = bench.diff().dropna()
+    cal = pd.date_range(min(d_idx.index.min(), d_bench.index.min()),
+                        max(d_idx.index.max(), d_bench.index.max()), freq="D")
+    d_idx = d_idx.reindex(cal)
+    d_bench = d_bench.reindex(cal)
 
     def _pair(lag: int) -> pd.DataFrame:
         return pd.concat({"idx": d_idx, "bench": d_bench.shift(lag)},
@@ -119,7 +130,7 @@ def main() -> None:
     (BENCH_DIR / "comparison.json").write_text(json.dumps(results, indent=2))
     for name, r in results.items():
         print(f"{name}: level={r['level_corr']:.2f} diff={r['diff_corr']:.2f} "
-              f"best lag={best_lag(r['leadlag']):+d} "
+              f"best lag={best_lag(r['leadlag']):+d} calendar days "
               f"band={r['noise_band']:.3f} "
               f"leads={'yes' if r['leads'] else 'no'} (negative lag = we lead; "
               f"lead claimed only if it clears the noise band vs lag 0)")

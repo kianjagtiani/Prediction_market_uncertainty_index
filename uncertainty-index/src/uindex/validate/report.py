@@ -56,7 +56,8 @@ def main() -> None:
     for name, r in bench.items():
         lines.append(f"- **{name}**: level corr {r['level_corr']:.2f}, "
                      f"diff corr {r['diff_corr']:.2f}, "
-                     f"best lag {benchmarks.best_lag(r['leadlag']):+d}, "
+                     f"best lag {benchmarks.best_lag(r['leadlag']):+d} "
+                     f"calendar days, "
                      f"leads: {'yes' if r['leads'] else 'no'} "
                      f"(noise band {r['noise_band']:.3f}; a lead is claimed "
                      f"only if best-lag corr beats lag-0 by the band). "
