@@ -3,6 +3,10 @@ import pandas as pd
 
 from . import compute, config, universe
 
+# Each gauge reads its own eligibility flag; they are not interchangeable.
+GAUGE_ELIGIBILITY = {"turbulence": "eligible_turbulence",
+                     "unresolvedness": "eligible_unresolvedness"}
+
 
 def _weighted_rows(vals: pd.DataFrame, w: pd.DataFrame) -> pd.Series:
     """Row-wise weighted mean over weight-bearing members (NaN if none)."""
@@ -10,27 +14,32 @@ def _weighted_rows(vals: pd.DataFrame, w: pd.DataFrame) -> pd.Series:
     return (vals * w).sum(axis=1, min_count=1) / w.sum(axis=1, min_count=1)
 
 
-def _index_series(sub: pd.DataFrame, ewma_halflife: float,
-                  clip_lo: float, clip_hi: float) -> pd.DataFrame:
-    """sub: eligible rows of one universe. Returns date-indexed raw gauges."""
+def _gauge_series(sub: pd.DataFrame, gauge: str, p: dict) -> pd.DataFrame:
+    """sub: the rows of one universe eligible for `gauge` (the two gauges do
+    not share an eligibility mask — see universe.apply_pit_rules rule 5).
+    Returns a date-indexed frame of `raw` and `n_constituents`."""
     probs = sub.pivot_table(index="date", columns="market_id",
                             values="close_prob", aggfunc="last")
     weights = sub.pivot_table(index="date", columns="market_id",
                               values="weight", aggfunc="last")
 
-    logits = pd.DataFrame(compute.logit(probs.values, clip_lo, clip_hi),
-                          index=probs.index, columns=probs.columns)
-    vols = logits.diff().apply(
-        lambda col: compute.ewma_vol(col.dropna(), halflife=ewma_halflife)
-    ).reindex(probs.index)
-    entropy = pd.DataFrame(compute.binary_entropy(probs.values, clip_lo, clip_hi),
-                           index=probs.index, columns=probs.columns)
+    if gauge == "turbulence":
+        logits = pd.DataFrame(
+            compute.logit(probs.values, p["clip_lo"], p["clip_hi"]),
+            index=probs.index, columns=probs.columns)
+        vals = logits.diff().apply(
+            lambda col: compute.ewma_vol(col.dropna(),
+                                         halflife=p["ewma_halflife"])
+        ).reindex(probs.index)
+    else:
+        vals = pd.DataFrame(
+            compute.binary_entropy(probs.values, p["clip_lo"], p["clip_hi"]),
+            index=probs.index, columns=probs.columns)
 
     # weight-bearing members only: a priced market with no usable weight
-    # contributes nothing to either gauge.
+    # contributes nothing.
     return pd.DataFrame({
-        "turbulence": _weighted_rows(vols, weights),
-        "unresolvedness": _weighted_rows(entropy, weights),
+        "raw": _weighted_rows(vals, weights),
         "n_constituents": (probs.notna() & weights.notna()
                            & (weights > 0)).sum(axis=1),
     })
@@ -44,26 +53,25 @@ def compute_indices(flagged_panel: pd.DataFrame,
          "seed_days": config.SEED_DAYS,
          "clip_lo": config.CLIP_LO, "clip_hi": config.CLIP_HI,
          **(params or {})}
-    eligible = flagged_panel[flagged_panel["eligible"]]
 
     tidy, members = [], []
     for index_name, categories in config.INDEX_UNIVERSES.items():
-        sub = eligible[eligible["category"].isin(categories)]
-        if sub.empty:
-            continue
-        series = _index_series(sub, p["ewma_halflife"],
-                               p["clip_lo"], p["clip_hi"])
-        for gauge in ("turbulence", "unresolvedness"):
-            raw = series[gauge]
-            scaled = compute.percentile_scale(raw, seed_days=p["seed_days"])
+        for gauge, flag in GAUGE_ELIGIBILITY.items():
+            sub = flagged_panel[flagged_panel[flag]
+                                & flagged_panel["category"].isin(categories)]
+            if sub.empty:
+                continue
+            series = _gauge_series(sub, gauge, p)
+            scaled = compute.percentile_scale(series["raw"],
+                                              seed_days=p["seed_days"])
             tidy.append(pd.DataFrame({
                 "date": series.index, "index": index_name, "gauge": gauge,
-                "raw": raw.values, "value": scaled.values,
+                "raw": series["raw"].values, "value": scaled.values,
             }))
-        members.append(pd.DataFrame({
-            "date": series.index, "index": index_name,
-            "n_constituents": series["n_constituents"].values,
-        }))
+            members.append(pd.DataFrame({
+                "date": series.index, "index": index_name, "gauge": gauge,
+                "n_constituents": series["n_constituents"].values,
+            }))
 
     if not tidy:
         raise ValueError("no eligible rows in any universe")

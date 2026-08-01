@@ -18,7 +18,8 @@ def _synthetic_flagged_panel(shock_day="2024-09-01"):
         frames.append(pd.DataFrame({
             "market_id": f"m{i}", "date": dates,
             "close_prob": np.clip(probs, 0.02, 0.98),
-            "category": "ECON_FED", "eligible": True, "weight": 1.0,
+            "category": "ECON_FED", "weight": 1.0,
+            "eligible_turbulence": True, "eligible_unresolvedness": True,
         }))
     return pd.concat(frames, ignore_index=True)
 
@@ -54,7 +55,8 @@ def test_ineligible_markets_do_not_move_index():
     extra = panel[panel["market_id"] == "m0"].copy()
     extra["market_id"] = "poison"
     extra["close_prob"] = 0.5
-    extra["eligible"] = False
+    extra["eligible_turbulence"] = False
+    extra["eligible_unresolvedness"] = False
     out2, _ = pipeline.compute_indices(pd.concat([poisoned, extra]),
                                     params={"seed_days": 30})
     merged = out1.merge(out2, on=["date", "index", "gauge"], suffixes=("_a", "_b"))
@@ -77,9 +79,37 @@ def test_n_constituents_counts_weight_bearing_only():
     assert (econ == 7).all()  # 8 priced, 1 carries no weight
 
 
+def test_gauges_read_their_own_eligibility_mask():
+    """A pinned long shot is out of turbulence but must still be counted by
+    unresolvedness, and must drag that gauge's raw level down."""
+    panel = _synthetic_flagged_panel()
+    long_shot = panel[panel["market_id"] == "m0"].copy()
+    long_shot["market_id"] = "longshot"
+    long_shot["close_prob"] = 0.005
+    long_shot["eligible_turbulence"] = False
+    both = pd.concat([panel, long_shot], ignore_index=True)
+
+    _, counts = pipeline.compute_indices(both, params={"seed_days": 30})
+    econ = counts[counts["index"] == "ECON_FED"].set_index(["gauge", "date"])
+    assert (econ.loc["turbulence", "n_constituents"] == 8).all()
+    assert (econ.loc["unresolvedness", "n_constituents"] == 9).all()
+
+    base, _ = pipeline.compute_indices(panel, params={"seed_days": 30})
+    with_ls, _ = pipeline.compute_indices(both, params={"seed_days": 30})
+
+    def gauge(out, name):
+        return out[(out["index"] == "ECON_FED") & (out["gauge"] == name)
+                   ].set_index("date")["raw"]
+
+    pd.testing.assert_series_equal(gauge(base, "turbulence"),
+                                   gauge(with_ls, "turbulence"))
+    assert (gauge(with_ls, "unresolvedness")
+            < gauge(base, "unresolvedness")).all()
+
+
 def test_empty_universe_raises_clearly():
     panel = _synthetic_flagged_panel()
-    panel["eligible"] = False
+    panel[["eligible_turbulence", "eligible_unresolvedness"]] = False
     with pytest.raises(ValueError, match="no eligible rows"):
         pipeline.compute_indices(panel, params={"seed_days": 30})
 
@@ -118,8 +148,8 @@ def test_causal_pin_truncation_invariance_and_flatline_exit():
     coll = flagged[flagged["market_id"] == "collapser"]
     first_out = collapse + pd.Timedelta(days=universe.config.PIN_CONSECUTIVE_DAYS - 1)
     assert coll[(coll["date"] >= collapse)
-                & (coll["date"] < first_out)]["eligible"].all()
-    assert not coll[coll["date"] >= first_out]["eligible"].any()
+                & (coll["date"] < first_out)]["eligible_turbulence"].all()
+    assert not coll[coll["date"] >= first_out]["eligible_turbulence"].any()
 
     full, _ = pipeline.compute_indices(flagged, params={"seed_days": 30})
     cut, _ = pipeline.compute_indices(universe.apply_pit_rules(meta, truncated),

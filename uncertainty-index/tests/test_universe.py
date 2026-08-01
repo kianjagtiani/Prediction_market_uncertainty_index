@@ -30,14 +30,14 @@ def test_resolution_exclusion_window():
     out = universe.apply_pit_rules(meta, panel)
     a = out[out["market_id"] == "pm_a"]
     last3 = a[a["date"] > pd.Timestamp("2024-03-01") - pd.Timedelta(days=3)]
-    assert not last3["eligible"].any()
-    assert a[a["date"] == pd.Timestamp("2024-02-01")]["eligible"].all()
+    assert not last3["eligible_turbulence"].any()
+    assert a[a["date"] == pd.Timestamp("2024-02-01")]["eligible_turbulence"].all()
 
 
 def test_rolling_floor_drops_small_polymarket():
     meta, panel = _meta_panel()
     out = universe.apply_pit_rules(meta, panel)
-    assert not out[out["market_id"] == "pm_small"]["eligible"].any()
+    assert not out[out["market_id"] == "pm_small"]["eligible_turbulence"].any()
 
 
 def test_pm_nan_notional_is_ineligible():
@@ -46,20 +46,20 @@ def test_pm_nan_notional_is_ineligible():
     meta, panel = _meta_panel()
     panel.loc[panel["market_id"] == "pm_a", "daily_notional_usd"] = np.nan
     out = universe.apply_pit_rules(meta, panel)
-    assert not out[out["market_id"] == "pm_a"]["eligible"].any()
+    assert not out[out["market_id"] == "pm_a"]["eligible_turbulence"].any()
 
 
 def test_rolling_floor_same_rule_both_venues():
     meta, panel = _meta_panel()
     # 1000/day * 7d rolling mean = 1000 < 5000 floor -> ineligible
     out = universe.apply_pit_rules(meta, panel)
-    assert not out[out["market_id"] == "ka_s1"]["eligible"].iloc[10:].any()
+    assert not out[out["market_id"] == "ka_s1"]["eligible_turbulence"].iloc[10:].any()
     # raise notional -> eligible once the rolling window fills
     panel.loc[panel["market_id"] == "ka_s1", "daily_notional_usd"] = 10000.0
     out2 = universe.apply_pit_rules(meta, panel)
     ka = out2[out2["market_id"] == "ka_s1"]
-    assert not ka["eligible"].iloc[:6].any()  # min_periods = window
-    assert ka["eligible"].iloc[10:-3].all()
+    assert not ka["eligible_turbulence"].iloc[:6].any()  # min_periods = window
+    assert ka["eligible_turbulence"].iloc[10:-3].all()
 
 
 def test_strike_group_keeps_only_deepest():
@@ -68,8 +68,8 @@ def test_strike_group_keeps_only_deepest():
     panel.loc[panel["market_id"] == "ka_s1", "daily_notional_usd"] = 10000.0
     panel.loc[panel["market_id"] == "ka_s2", "daily_notional_usd"] = 6000.0
     out = universe.apply_pit_rules(meta, panel)
-    assert out[out["market_id"] == "ka_s1"]["eligible"].any()
-    assert not out[out["market_id"] == "ka_s2"]["eligible"].any()
+    assert out[out["market_id"] == "ka_s1"]["eligible_turbulence"].any()
+    assert not out[out["market_id"] == "ka_s2"]["eligible_turbulence"].any()
 
 
 def test_strike_rep_migrates_with_liquidity():
@@ -82,14 +82,14 @@ def test_strike_rep_migrates_with_liquidity():
     out = universe.apply_pit_rules(meta, panel)
 
     def rep_on(day):
-        rows = out[(out["date"] == pd.Timestamp(day)) & out["eligible"]
+        rows = out[(out["date"] == pd.Timestamp(day)) & out["eligible_turbulence"]
                    & out["market_id"].str.startswith("ka_")]
         return rows["market_id"].tolist()
 
     assert rep_on("2024-01-20") == ["ka_s1"]
     assert rep_on("2024-02-15") == ["ka_s2"]  # rolling has fully migrated
     # exactly one eligible strike per event per day once the window fills
-    ka_days = out[out["eligible"] & out["market_id"].str.startswith("ka_")]
+    ka_days = out[out["eligible_turbulence"] & out["market_id"].str.startswith("ka_")]
     assert (ka_days.groupby("date").size() == 1).all()
 
 
@@ -102,11 +102,42 @@ def test_strike_tie_break_is_row_order_independent():
                                          panel)
 
     def kept(out):
-        ka = out[out["eligible"] & out["market_id"].str.startswith("ka_")]
+        ka = out[out["eligible_turbulence"] & out["market_id"].str.startswith("ka_")]
         return set(ka["market_id"])
 
     # lexicographically first of the tied strikes, either row order
     assert kept(forward) == kept(reversed_) == {"ka_s1"}
+
+
+def test_strike_rep_promotes_runner_up_when_winner_is_overridden(tmp_path):
+    """The representative must be elected AFTER dedup and overrides. Electing
+    it first and then dropping the winner deletes the whole event-day instead
+    of promoting the runner-up."""
+    meta, panel = _meta_panel()
+    panel.loc[panel["market_id"] == "ka_s1", "daily_notional_usd"] = 10000.0
+    panel.loc[panel["market_id"] == "ka_s2", "daily_notional_usd"] = 6000.0
+    csv = tmp_path / "duplicates.csv"
+    csv.write_text("drop_market_id,reason\nka_s1,test dup\n")
+    out = universe.apply_pit_rules(meta, panel, overrides_path=csv)
+    day = out[(out["date"] == pd.Timestamp("2024-02-01"))
+              & out["eligible_turbulence"]]
+    assert set(day["market_id"]) & {"ka_s1", "ka_s2"} == {"ka_s2"}
+
+
+def test_strike_rep_promotes_runner_up_when_winner_is_deduped(tmp_path):
+    """Same failure via rule 3: the deepest strike has a Polymarket
+    exact-title twin that was listed earlier, so it is deduped away."""
+    meta, panel = _meta_panel()
+    meta.loc[meta["market_id"] == "pm_a", "question"] = "CPI above 3%?"
+    meta.loc[meta["market_id"] == "pm_a", "open_date"] = pd.Timestamp("2023-12-01")
+    panel.loc[panel["market_id"] == "ka_s1", "daily_notional_usd"] = 10000.0
+    panel.loc[panel["market_id"] == "ka_s2", "daily_notional_usd"] = 6000.0
+    out = universe.apply_pit_rules(meta, panel,
+                                   audit_path=tmp_path / "dedup.csv")
+    day = out[(out["date"] == pd.Timestamp("2024-02-01"))
+              & out["eligible_turbulence"]]
+    assert "ka_s1" not in set(day["market_id"])  # deduped: pm_a opened first
+    assert "ka_s2" in set(day["market_id"])
 
 
 def test_manual_override_dedup(tmp_path):
@@ -114,13 +145,13 @@ def test_manual_override_dedup(tmp_path):
     csv = tmp_path / "duplicates.csv"
     csv.write_text("drop_market_id,reason\npm_a,test dup\n")
     out = universe.apply_pit_rules(meta, panel, overrides_path=csv)
-    assert not out[out["market_id"] == "pm_a"]["eligible"].any()
+    assert not out[out["market_id"] == "pm_a"]["eligible_turbulence"].any()
 
 
 def test_weights_positive_for_eligible():
     meta, panel = _meta_panel()
     out = universe.apply_pit_rules(meta, panel)
-    assert (out.loc[out["eligible"], "weight"] > 0).all()
+    assert (out.loc[out["eligible_turbulence"], "weight"] > 0).all()
 
 
 def _mixed_venue(notional=20_000.0):
@@ -146,7 +177,7 @@ def _mixed_venue(notional=20_000.0):
 def test_cross_venue_weights_are_commensurable():
     meta, panel = _mixed_venue()
     out = universe.apply_pit_rules(meta, panel)
-    day = out[(out["date"] == pd.Timestamp("2024-02-01")) & out["eligible"]]
+    day = out[(out["date"] == pd.Timestamp("2024-02-01")) & out["eligible_turbulence"]]
     assert set(day["market_id"]) == {"pm_big", "ka_big"}
     assert day["weight"].max() / day["weight"].min() < 10.0
 
@@ -182,8 +213,34 @@ def test_causal_pin_collapse_day_stays_flatline_leaves():
     meta, panel, collapse, first_out = _pin_panel()
     out = universe.apply_pit_rules(meta, panel)
     pin = out[out["market_id"] == "pm_pin"]
-    assert pin[(pin["date"] >= collapse) & (pin["date"] < first_out)]["eligible"].all()
-    assert not pin[pin["date"] >= first_out]["eligible"].any()
+    assert pin[(pin["date"] >= collapse) & (pin["date"] < first_out)]["eligible_turbulence"].all()
+    assert not pin[pin["date"] >= first_out]["eligible_turbulence"].any()
+
+
+def test_pin_rule_is_turbulence_only():
+    """The pin rule is a settlement-artefact guard for turbulence. Applying
+    it to unresolvedness would delete every confidently near-certain market,
+    which is exactly what that gauge exists to measure."""
+    meta, panel, collapse, first_out = _pin_panel()
+    out = universe.apply_pit_rules(meta, panel)
+    pin = out[out["market_id"] == "pm_pin"]
+    flat = pin[pin["date"] >= first_out]
+    assert not flat["eligible_turbulence"].any()
+    assert flat["eligible_unresolvedness"].all()
+
+
+def test_long_shot_stays_in_unresolvedness():
+    """A market that trades at 0.5c all year never resolves - it is simply
+    unlikely. It is pinned by level, so turbulence drops it, but it must
+    keep contributing its (low) entropy to unresolvedness."""
+    meta, panel, _, _ = _pin_panel()
+    long_shot = panel["market_id"] == "pm_pin"
+    panel.loc[long_shot, "close_prob"] = 0.005
+    out = universe.apply_pit_rules(meta, panel)
+    pin = out[out["market_id"] == "pm_pin"]
+    late = pin[pin["date"] >= pd.Timestamp("2024-02-01")]
+    assert not late["eligible_turbulence"].any()
+    assert late["eligible_unresolvedness"].all()
 
 
 def test_causal_pin_gap_does_not_reset_the_run():
@@ -195,9 +252,9 @@ def test_causal_pin_gap_does_not_reset_the_run():
     pin = out[out["market_id"] == "pm_pin"]
     # the gap day itself is ineligible (no price) but only shifts the run by
     # one observation: the 5th pinned close now lands on first_out + 1 day
-    assert not pin[pin["date"] == gap]["eligible"].any()
-    assert pin[pin["date"] == first_out]["eligible"].all()
-    assert not pin[pin["date"] > first_out]["eligible"].any()
+    assert not pin[pin["date"] == gap]["eligible_turbulence"].any()
+    assert pin[pin["date"] == first_out]["eligible_turbulence"].all()
+    assert not pin[pin["date"] > first_out]["eligible_turbulence"].any()
 
 
 def test_causal_pin_bounce_readmits():
@@ -205,8 +262,8 @@ def test_causal_pin_bounce_readmits():
     back = pd.Timestamp("2024-02-01")
     out = universe.apply_pit_rules(meta, panel)
     rnd = out[out["market_id"] == "pm_round"]
-    assert not rnd[(rnd["date"] >= first_out) & (rnd["date"] < back)]["eligible"].any()
-    assert rnd[rnd["date"] >= back]["eligible"].all()
+    assert not rnd[(rnd["date"] >= first_out) & (rnd["date"] < back)]["eligible_turbulence"].any()
+    assert rnd[rnd["date"] >= back]["eligible_turbulence"].all()
 
 
 def _title_pair(venues, opens, closes):
@@ -234,8 +291,8 @@ def test_same_venue_repeated_title_disjoint_windows_both_survive():
                               ["2024-01-01", "2024-04-01"],
                               ["2024-02-01", "2024-05-01"])
     out = universe.apply_pit_rules(meta, panel)
-    assert out[out["market_id"] == "m_a"]["eligible"].any()
-    assert out[out["market_id"] == "m_b"]["eligible"].any()
+    assert out[out["market_id"] == "m_a"]["eligible_turbulence"].any()
+    assert out[out["market_id"] == "m_b"]["eligible_turbulence"].any()
 
 
 def test_cross_venue_same_title_overlap_dedups_keeps_earlier_open(tmp_path):
@@ -244,8 +301,8 @@ def test_cross_venue_same_title_overlap_dedups_keeps_earlier_open(tmp_path):
                               ["2024-02-01", "2024-02-15"])
     audit = tmp_path / "dedup_audit.csv"
     out = universe.apply_pit_rules(meta, panel, audit_path=audit)
-    assert not out[out["market_id"] == "m_b"]["eligible"].any()  # later open
-    assert out[out["market_id"] == "m_a"]["eligible"].any()
+    assert not out[out["market_id"] == "m_b"]["eligible_turbulence"].any()  # later open
+    assert out[out["market_id"] == "m_a"]["eligible_turbulence"].any()
     rows = pd.read_csv(audit)
     assert rows["drop_market_id"].tolist() == ["m_b"]
     assert rows["keep_market_id"].tolist() == ["m_a"]
@@ -258,8 +315,8 @@ def test_dedup_nat_open_date_loses(tmp_path):
     meta.loc[meta["market_id"] == "m_a", "open_date"] = pd.NaT
     audit = tmp_path / "dedup_audit.csv"
     out = universe.apply_pit_rules(meta, panel, audit_path=audit)
-    assert not out[out["market_id"] == "m_a"]["eligible"].any()
-    assert out[out["market_id"] == "m_b"]["eligible"].any()
+    assert not out[out["market_id"] == "m_a"]["eligible_turbulence"].any()
+    assert out[out["market_id"] == "m_b"]["eligible_turbulence"].any()
     assert pd.read_csv(audit)["keep_market_id"].tolist() == ["m_b"]
 
 
@@ -267,7 +324,7 @@ def test_missing_close_date_counted_and_reported(capsys):
     meta, panel = _meta_panel()
     meta.loc[meta["market_id"] == "pm_a", "close_date"] = pd.NaT
     out = universe.apply_pit_rules(meta, panel)
-    assert not out[out["market_id"] == "pm_a"]["eligible"].any()
+    assert not out[out["market_id"] == "pm_a"]["eligible_turbulence"].any()
     assert "1" in capsys.readouterr().out
 
 
@@ -276,12 +333,12 @@ def test_rows_before_open_date_are_ineligible():
     meta.loc[meta["market_id"] == "pm_a", "open_date"] = pd.Timestamp("2024-01-15")
     out = universe.apply_pit_rules(meta, panel)
     a = out[out["market_id"] == "pm_a"]
-    assert not a[a["date"] < pd.Timestamp("2024-01-15")]["eligible"].any()
-    assert a[a["date"] == pd.Timestamp("2024-01-15")]["eligible"].all()
+    assert not a[a["date"] < pd.Timestamp("2024-01-15")]["eligible_turbulence"].any()
+    assert a[a["date"] == pd.Timestamp("2024-01-15")]["eligible_turbulence"].all()
 
 
 def test_missing_open_date_does_not_exclude():
     meta, panel = _meta_panel()
     meta.loc[meta["market_id"] == "pm_a", "open_date"] = pd.NaT
     out = universe.apply_pit_rules(meta, panel)
-    assert out[out["market_id"] == "pm_a"]["eligible"].any()
+    assert out[out["market_id"] == "pm_a"]["eligible_turbulence"].any()

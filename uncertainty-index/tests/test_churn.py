@@ -14,7 +14,7 @@ DATES = pd.date_range("2024-01-01", periods=30, freq="D")
 
 def _flagged():
     rows = [{"date": d, "market_id": "A", "close_prob": 0.5, "weight": 1.0,
-             "eligible": True, "category": "WAR"} for d in DATES]
+             "eligible_turbulence": True, "category": "WAR"} for d in DATES]
     for i, d in enumerate(DATES):
         if i < 8:
             continue
@@ -23,7 +23,8 @@ def _flagged():
         else:
             p = 0.9 if i % 2 == 0 else 0.1
         rows.append({"date": d, "market_id": "B", "close_prob": p,
-                     "weight": 100.0, "eligible": True, "category": "WAR"})
+                     "weight": 100.0, "category": "WAR",
+                     "eligible_turbulence": True})
     return pd.DataFrame(rows)
 
 

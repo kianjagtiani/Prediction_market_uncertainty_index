@@ -16,8 +16,8 @@ def _default_params() -> dict:
         "pm_min_rolling_notional": config.POLYMARKET_MIN_ROLLING_NOTIONAL_USD,
         "ka_min_rolling_notional": config.KALSHI_MIN_ROLLING_NOTIONAL_USD,
         "rolling_window_days": config.ROLLING_WINDOW_DAYS,
-        "pin_lo": config.CLIP_LO,
-        "pin_hi": config.CLIP_HI,
+        "pin_lo": config.PIN_LO,
+        "pin_hi": config.PIN_HI,
         "pin_days": config.PIN_CONSECUTIVE_DAYS,
     }
 
@@ -39,6 +39,24 @@ def _pinned_run(prob: pd.Series, lo: float, hi: float, days: int) -> pd.Series:
     pinned = ((obs >= hi) | (obs <= lo)).astype(float)
     run = pinned.rolling(days, min_periods=days).min().eq(1.0)
     return run.reindex(prob.index, fill_value=False)
+
+
+def _strike_representatives(df: pd.DataFrame, mask: pd.Series,
+                            rolling: pd.Series) -> pd.Series:
+    """Per Kalshi event-day, keep only the deepest-notional eligible strike.
+
+    Ties break on market_id so re-crawls are reproducible. Evaluated against
+    whatever `mask` it is handed, so it must be called AFTER every exclusion
+    rule that could delete the strike it elects (otherwise the runner-up is
+    never promoted and the whole event-day vanishes) and separately per
+    gauge, since the gauges do not share an eligibility mask.
+    """
+    ka = df["venue"].eq("kalshi") & df["event_ticker"].notna()
+    cand = df.loc[ka & mask, ["event_ticker", "date", "market_id"]]
+    reps = (cand.assign(roll=rolling)
+            .sort_values(["roll", "market_id"], ascending=[False, True])
+            .drop_duplicates(["event_ticker", "date"]))
+    return mask & (~ka | df.index.isin(reps.index))
 
 
 def _windows_overlap(a: pd.Series, b: pd.Series) -> bool:
@@ -89,6 +107,19 @@ def apply_pit_rules(meta: pd.DataFrame, panel: pd.DataFrame,
                     params: dict | None = None,
                     overrides_path: Path = DEFAULT_OVERRIDES,
                     audit_path: Path = DEFAULT_DEDUP_AUDIT) -> pd.DataFrame:
+    """Flag every panel row with per-gauge eligibility and a PIT weight.
+
+    Emits TWO flags, not one, because the two gauges want different
+    populations (see rule 5):
+
+    - `eligible_turbulence`      base rules AND not pinned
+    - `eligible_unresolvedness`  base rules only
+
+    The base rules (trading window, liquidity floor, cross-venue dedup,
+    manual overrides) are shared; the Kalshi strike representative is
+    resolved separately per gauge so each sees the deepest strike that is
+    actually eligible for it.
+    """
     p = {**_default_params(), **(params or {})}
     df = panel.merge(
         meta[["market_id", "venue", "category", "event_ticker",
@@ -109,22 +140,19 @@ def apply_pit_rules(meta: pd.DataFrame, panel: pd.DataFrame,
         print(f"universe: {n_no_close} markets have no close_date and are "
               f"excluded for their entire life")
 
-    # 2. Early-resolution guard, causal. A market that settles months before
-    #    its close_date collapses (e.g. 0.40 -> 0.995) and flatlines; the
-    #    close_date-based cutoff above misses it entirely. The collapse day
-    #    itself stays in (genuine repricing); once pin_days observed closes
-    #    have all been pinned the flatline leaves, and a bounce back inside
-    #    the band re-admits it. No future data is read.
-    pinned = df.groupby("market_id")["close_prob"].transform(
-        _pinned_run, p["pin_lo"], p["pin_hi"], p["pin_days"]
-    )
-    eligible &= ~pinned
-
-    # 3. Liquidity floor + weight: trailing rolling mean of daily notional,
-    #    same rule for both venues. PM rows carry daily_notional_usd = NaN
-    #    when the Goldsky volume sweep hasn't run (normalize's backward-
-    #    compatible path); NaN rolling fails the >= floor comparison, so
-    #    those rows stay ineligible rather than silently passing.
+    # 2. Liquidity floor + weight: trailing rolling mean of daily notional.
+    #    The floor is venue-parameterised but currently equal on both venues,
+    #    which ASSUMES the two daily_notional_usd inputs are the same
+    #    quantity. They are built differently and that equality is not yet
+    #    verified: Kalshi is volume_fp * close_prob (contracts x price, one
+    #    leg per market), Polymarket is the sum of the USDC collateral leg of
+    #    CLOB fills over BOTH outcome tokens. If the reconciliation in
+    #    data/raw/polymarket/volumes_coverage.csv shows a systematic ratio,
+    #    correct it here via pm_min_rolling_notional rather than silently.
+    #    PM rows carry daily_notional_usd = NaN when the Goldsky volume sweep
+    #    hasn't run or doesn't cover the day (normalize keeps uncovered days
+    #    NaN); NaN rolling fails the >= floor, so those rows stay ineligible
+    #    rather than being read as "$0 traded".
     rolling = (
         df.groupby("market_id")["daily_notional_usd"]
         .transform(lambda s: s.rolling(p["rolling_window_days"],
@@ -136,27 +164,43 @@ def apply_pit_rules(meta: pd.DataFrame, panel: pd.DataFrame,
     # log1p damps whales identically on both venues.
     df["weight"] = np.log1p(rolling)
 
-    # 4. Kalshi strike groups: per day, the eligible strike with the deepest
-    #    trailing notional represents the event (ties -> market_id, so
-    #    re-crawls are reproducible); its siblings sit out that day.
-    ka = df["venue"].eq("kalshi") & df["event_ticker"].notna()
-    cand = df.loc[ka & eligible, ["event_ticker", "date", "market_id"]]
-    reps = (cand.assign(roll=rolling)
-            .sort_values(["roll", "market_id"], ascending=[False, True])
-            .drop_duplicates(["event_ticker", "date"]))
-    eligible &= ~ka | df.index.isin(reps.index)
-
-    # 5. Cross-venue exact-question dedup: keep the earlier listing.
+    # 3. Cross-venue exact-question dedup: keep the earlier listing.
     dups = _cross_venue_dups(meta)
     if dups:
         Path(audit_path).parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(dups).to_csv(audit_path, index=False)
         eligible &= ~df["market_id"].isin({d["drop_market_id"] for d in dups})
 
-    # 6. Manual overrides
+    # 4. Manual overrides
     if Path(overrides_path).exists():
         drops = set(pd.read_csv(overrides_path)["drop_market_id"])
         eligible &= ~df["market_id"].isin(drops)
 
-    df["eligible"] = eligible.fillna(False)
+    base = eligible.fillna(False)
+
+    # 5. Early-resolution guard, causal — TURBULENCE ONLY. A market that
+    #    settles months before its close_date collapses (e.g. 0.40 -> 0.995)
+    #    and flatlines; the close_date cutoff in rule 1 misses it entirely,
+    #    and the settlement jump is a bookkeeping artefact, not news. The
+    #    collapse day itself stays in (genuine repricing); once pin_days
+    #    observed closes have all been pinned the flatline leaves, and a
+    #    bounce back inside the band re-admits it. No future data is read.
+    #
+    #    It must NOT touch unresolvedness. That gauge is a weighted mean of
+    #    binary entropy, i.e. it exists to measure how near-certain the
+    #    catalog is; the pin trigger is a price LEVEL, not evidence of
+    #    settlement, so applying it there deletes exactly the long shots the
+    #    gauge is supposed to see and censors the series from below.
+    #    Tradeoff accepted knowingly: a genuinely settled market therefore
+    #    keeps contributing its (low) entropy to unresolvedness until the
+    #    rule-1 close_date cutoff removes it.
+    pinned = df.groupby("market_id")["close_prob"].transform(
+        _pinned_run, p["pin_lo"], p["pin_hi"], p["pin_days"]
+    )
+
+    # 6. Kalshi strike representative, resolved per gauge and last of all —
+    #    see _strike_representatives.
+    df["eligible_unresolvedness"] = _strike_representatives(df, base, rolling)
+    df["eligible_turbulence"] = _strike_representatives(
+        df, base & ~pinned, rolling)
     return df.drop(columns=["question"]).reset_index(drop=True)

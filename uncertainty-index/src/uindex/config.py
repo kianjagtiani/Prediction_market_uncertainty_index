@@ -17,6 +17,11 @@ POLYMARKET_MIN_ROLLING_NOTIONAL_USD = 5_000  # symmetric with Kalshi
 KALSHI_MIN_ROLLING_NOTIONAL_USD = 5_000
 ROLLING_WINDOW_DAYS = 7
 PIN_CONSECUTIVE_DAYS = 5  # observed pinned days before exclusion (causal)
+# Pin band. Deliberately NOT CLIP_LO/CLIP_HI even though the defaults match:
+# the clip band is a numerical-stability bound on the index math, the pin band
+# is an economic judgement about "this market has settled". Perturbing one
+# must not move the other.
+PIN_LO, PIN_HI = 0.01, 0.99
 
 # Ingestion fetch bound only (not a universe rule): a 7-day rolling mean
 # of $5k implies >= $35k lifetime, so lifetime/slack is a lossless

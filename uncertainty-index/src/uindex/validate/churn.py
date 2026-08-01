@@ -28,7 +28,7 @@ def decompose(flagged: pd.DataFrame,
     p = {"ewma_halflife": config.EWMA_HALFLIFE_DAYS,
          "clip_lo": config.CLIP_LO, "clip_hi": config.CLIP_HI,
          **(params or {})}
-    sub = flagged[flagged["eligible"] &
+    sub = flagged[flagged["eligible_turbulence"] &
                   flagged["category"].isin(config.INDEX_UNIVERSES["GLOBAL"])]
     probs = sub.pivot_table(index="date", columns="market_id",
                             values="close_prob", aggfunc="last")
