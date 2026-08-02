@@ -38,24 +38,46 @@ def volume_coverage(raw_dir) -> tuple[pd.Timestamp, pd.Timestamp] | None:
     return pd.Timestamp(m["first_date"]), pd.Timestamp(m["last_date"])
 
 
-def uncovered_markets(raw_dir) -> set[str]:
+class CoverageError(RuntimeError):
+    """The coverage gate would exclude so much of Polymarket that it is
+    deleting the venue rather than repairing it."""
+
+
+def uncovered_markets(raw_dir) -> set[str] | None:
     """PM markets the Goldsky sweep does not cover (negRisk, legacy AMM).
 
-    Written by polymarket_volume.write_coverage_report. Absent means the
-    report was never run, which is not evidence of coverage — the caller
-    warns and zero-fills nothing."""
+    Written by polymarket_volume.write_coverage_report. Returns None — not
+    an empty set — when the report is absent: that is "unknown", not "every
+    market is covered", and the caller must zero-fill nothing.
+
+    Raises CoverageError when the uncovered markets account for more than
+    config.PM_MAX_UNCOVERED_VOLUME_SHARE of the catalog's Gamma volume. The
+    check lives here, not in the ingest module, so it is re-evaluated on
+    every rebuild and cannot be bypassed by an already-complete ingest."""
     path = Path(raw_dir) / "polymarket" / "volumes_coverage.csv"
     if not path.exists():
-        return set()
+        return None
     rep = pd.read_csv(path)
-    return set(rep.loc[~rep["covered"].astype(bool), "market_id"])
+    bad = rep.loc[~rep["covered"].astype(bool)]
+    total = float(rep["gamma_lifetime_volume_usd"].sum())
+    share = (float(bad["gamma_lifetime_volume_usd"].sum()) / total
+             if total else 0.0)
+    if share > config.PM_MAX_UNCOVERED_VOLUME_SHARE:
+        raise CoverageError(
+            f"{share:.1%} of Polymarket's catalog volume sits in markets the "
+            f"orderbook subgraph does not cover (limit "
+            f"{config.PM_MAX_UNCOVERED_VOLUME_SHARE:.0%}); publishing from "
+            f"whatever survives the gate would misrepresent the venue. "
+            f"Resolve the negRisk/AMM coverage hole first — see "
+            f"{path}")
+    return set(bad["market_id"])
 
 
 def build_panel(pm_meta: pd.DataFrame, pm_prices: pd.DataFrame,
                 ka_meta: pd.DataFrame, ka_prices: pd.DataFrame,
                 pm_volumes: pd.DataFrame | None = None,
                 coverage: tuple[pd.Timestamp, pd.Timestamp] | None = None,
-                uncovered: set[str] = frozenset()
+                uncovered: set[str] | None = None
                 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     pm = pm_meta.copy()
     pm["event_ticker"] = np.nan
@@ -79,9 +101,11 @@ def build_panel(pm_meta: pd.DataFrame, pm_prices: pd.DataFrame,
         # already treats as ineligible rather than as a market that fell
         # below the liquidity floor. A truncated sweep therefore shrinks the
         # universe visibly instead of silently zeroing out Polymarket.
-        if coverage is None:
-            print("WARNING: no volumes_manifest.json - PM market-days with "
-                  "no fills stay NaN (ineligible), not $0")
+        if coverage is None or uncovered is None:
+            missing = ("volumes_manifest.json" if coverage is None
+                       else "volumes_coverage.csv")
+            print(f"WARNING: no {missing} - PM market-days with no fills "
+                  f"stay NaN (ineligible), not $0")
         else:
             # Same logic per market: a market the subgraph does not index
             # (negRisk, legacy AMM) has no fills for reasons that have

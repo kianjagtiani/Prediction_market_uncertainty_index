@@ -413,7 +413,7 @@ _FULL_COVERAGE = (pd.Timestamp("2024-01-01"), pd.Timestamp("2024-06-01"))
 
 def test_build_panel_merges_pm_volumes_with_zero_fill_for_pm_only():
     _, panel, _ = normalize.build_panel(*_panel_inputs(), _PM_VOLUMES,
-                                        _FULL_COVERAGE)
+                                        _FULL_COVERAGE, set())
     pm = panel[panel["market_id"] == "pm_1"].set_index("date")
     assert pm.loc[pd.Timestamp("2024-02-01"), "daily_notional_usd"] == 321.5
     # Inside the sweep's coverage, a PM day with no fills is genuinely zero.
@@ -427,7 +427,7 @@ def test_build_panel_keeps_uncovered_days_nan_not_zero():
     report every un-swept market-day as "$0 traded"."""
     _, panel, _ = normalize.build_panel(
         *_panel_inputs(), _PM_VOLUMES,
-        (pd.Timestamp("2024-01-01"), pd.Timestamp("2024-02-01")))
+        (pd.Timestamp("2024-01-01"), pd.Timestamp("2024-02-01")), set())
     pm = panel[panel["market_id"] == "pm_1"].set_index("date")
     assert pm.loc[pd.Timestamp("2024-02-01"), "daily_notional_usd"] == 321.5
     assert pd.isna(pm.loc[pd.Timestamp("2024-02-02"), "daily_notional_usd"])
@@ -475,30 +475,119 @@ def test_pm_notional_sums_both_outcome_tokens_of_a_market(tmp_path):
     assert vol.loc[0, "daily_notional_usd"] == pytest.approx(1200.0)
 
 
+def _coverage_fixture(tmp_path, gamma_ok=1_000_000.0):
+    """One well-covered whale plus the two known coverage-hole shapes: a
+    negRisk market with a token dust trickle, and one the sweep never saw."""
+    pm_dir = tmp_path / "polymarket"
+    pm_dir.mkdir(exist_ok=True)
+    pd.DataFrame({
+        "market_id": ["pm_ok", "pm_ok", "pm_negrisk"],
+        "date": pd.to_datetime(["2024-03-01", "2024-03-02", "2024-03-01"]),
+        "daily_notional_usd": [600_000.0, 360_000.0, 10.0],
+    }).to_parquet(pm_dir / "volumes.parquet", index=False)
+    pd.DataFrame({
+        "market_id": ["pm_ok", "pm_negrisk", "pm_missing"],
+        "total_volume_usd": [gamma_ok, 85_005.0, 50_000.0],
+    }).to_parquet(pm_dir / "markets.parquet", index=False)
+    return pm_dir
+
+
 def test_coverage_report_flags_markets_the_subgraph_does_not_index(tmp_path):
     """negRisk and legacy AMM fills are not in this subgraph (pm_559700: $0
     swept vs $85k Gamma). Without the report, normalize's zero-fill reads
     that as "genuinely zero notional" and the market silently disappears."""
-    pm_dir = tmp_path / "polymarket"
-    pm_dir.mkdir()
-    pd.DataFrame({
-        "market_id": ["pm_ok", "pm_ok", "pm_negrisk"],
-        "date": pd.to_datetime(["2024-03-01", "2024-03-02", "2024-03-01"]),
-        "daily_notional_usd": [60_000.0, 36_000.0, 10.0],
-    }).to_parquet(pm_dir / "volumes.parquet", index=False)
-    pd.DataFrame({
-        "market_id": ["pm_ok", "pm_negrisk", "pm_missing"],
-        "total_volume_usd": [100_000.0, 85_005.0, 50_000.0],
-    }).to_parquet(pm_dir / "markets.parquet", index=False)
-
+    pm_dir = _coverage_fixture(tmp_path)
     pv.write_coverage_report(pm_dir)
     rep = pd.read_csv(pm_dir / "volumes_coverage.csv").set_index("market_id")
-    assert rep.loc["pm_ok", "coverage"] == pytest.approx(0.96)
+    # 960k swept over both legs -> 480k single-leg -> 0.48 of Gamma's 1M.
+    assert rep.loc["pm_ok", "subgraph_notional_both_legs_usd"] == 960_000.0
+    assert rep.loc["pm_ok", "subgraph_notional_usd"] == pytest.approx(
+        960_000.0 / config.PM_TOKEN_LEGS_PER_FILL)
+    assert rep.loc["pm_ok", "coverage_single_leg"] == pytest.approx(0.48)
     assert bool(rep.loc["pm_ok", "covered"])
     assert not bool(rep.loc["pm_negrisk", "covered"])
     assert rep.loc["pm_missing", "subgraph_notional_usd"] == 0.0
     assert not bool(rep.loc["pm_missing", "covered"])
     assert normalize.uncovered_markets(tmp_path) == {"pm_negrisk", "pm_missing"}
+
+
+def test_coverage_verdicts_are_frozen_across_crawl_vintages(tmp_path):
+    """`total_volume_usd` is Gamma's lifetime volume as of the crawl, so
+    recomputing lets volume traded AFTER a published day flip that day's
+    eligibility on the next rebuild. A classified market keeps its verdict
+    and its vintage; only new markets are classified."""
+    pm_dir = _coverage_fixture(tmp_path)
+    (pm_dir / "volumes_manifest.json").write_text(json.dumps(
+        {"first_date": "2024-01-01T00:00:00",
+         "last_date": "2024-03-02T00:00:00", "n_fills": 3, "n_tokens": 2}))
+    pv.write_coverage_report(pm_dir)
+    first = pd.read_csv(pm_dir / "volumes_coverage.csv").set_index("market_id")
+    assert (first["vintage"] == "2024-03-02").all()
+
+    # Later vintage: pm_ok's lifetime volume has quadrupled (0.48 -> 0.12,
+    # which would fail the gate) and a new market appears.
+    pd.DataFrame({
+        "market_id": ["pm_ok", "pm_negrisk", "pm_missing", "pm_new"],
+        "total_volume_usd": [4_000_000.0, 85_005.0, 50_000.0, 20_000.0],
+    }).to_parquet(pm_dir / "markets.parquet", index=False)
+    (pm_dir / "volumes_manifest.json").write_text(json.dumps(
+        {"first_date": "2024-01-01T00:00:00",
+         "last_date": "2025-01-01T00:00:00", "n_fills": 9, "n_tokens": 4}))
+    pv.write_coverage_report(pm_dir)
+    later = pd.read_csv(pm_dir / "volumes_coverage.csv").set_index("market_id")
+    assert bool(later.loc["pm_ok", "covered"])  # verdict unchanged
+    assert later.loc["pm_ok", "coverage_single_leg"] == pytest.approx(0.48)
+    assert later.loc["pm_ok", "vintage"] == "2024-03-02"
+    assert later.loc["pm_new", "vintage"] == "2025-01-01"
+    assert not bool(later.loc["pm_new", "covered"])  # never swept
+
+
+def test_uncovered_share_above_the_limit_stops_the_rebuild(tmp_path):
+    """Below the limit the gate repairs the panel; above it, it is deleting
+    Polymarket and no index may be published from what survives."""
+    pm_dir = _coverage_fixture(tmp_path, gamma_ok=200_000.0)
+    pv.write_coverage_report(pm_dir)
+    rep = pd.read_csv(pm_dir / "volumes_coverage.csv").set_index("market_id")
+    assert bool(rep.loc["pm_ok", "covered"])  # the whale itself is fine
+    with pytest.raises(normalize.CoverageError, match="does not cover"):
+        normalize.uncovered_markets(tmp_path)
+
+
+def test_missing_coverage_report_is_unknown_not_all_covered(tmp_path):
+    """The sibling asymmetry that reinstated the zero-fill: volume_coverage
+    returns None for "unknown", so uncovered_markets must too."""
+    (tmp_path / "polymarket").mkdir()
+    assert normalize.uncovered_markets(tmp_path) is None
+    # A manifest without a coverage report armed the zero-fill anyway.
+    _, panel, _ = normalize.build_panel(*_panel_inputs(), _PM_VOLUMES,
+                                        _FULL_COVERAGE, None)
+    pm = panel[panel["market_id"] == "pm_1"].set_index("date")
+    assert pd.isna(pm.loc[pd.Timestamp("2024-02-02"), "daily_notional_usd"])
+
+
+def test_completion_needs_the_coverage_report(monkeypatch, tmp_path):
+    """A kill between assemble() and write_coverage_report() used to be
+    permanent: the next portion saw volumes.parquet, reported complete, and
+    the guard was never armed."""
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(pv, "OUT_DIR", tmp_path)
+    pd.DataFrame({"market_id": ["pm_1"],
+                  "date": pd.to_datetime(["2024-03-01"]),
+                  "daily_notional_usd": [600_000.0]}
+                 ).to_parquet(tmp_path / "volumes.parquet", index=False)
+    pd.DataFrame({"market_id": ["pm_1"], "total_volume_usd": [500_000.0]}
+                 ).to_parquet(tmp_path / "markets.parquet", index=False)
+    pd.DataFrame({"token_id": pd.Series(dtype=str),
+                  "date": pd.Series(dtype="datetime64[ns]"),
+                  "notional_usd": pd.Series(dtype="float64")}
+                 ).to_parquet(tmp_path / "volumes_by_token.parquet",
+                              index=False)
+    pd.DataFrame({"token_id": pd.Series(dtype=str),
+                  "market_id": pd.Series(dtype=str)}
+                 ).to_parquet(tmp_path / "token_map.parquet", index=False)
+
+    assert pv.main(pages=1) is True
+    assert (tmp_path / "volumes_coverage.csv").exists()
 
 
 def test_uncovered_markets_are_never_zero_filled():

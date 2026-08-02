@@ -68,6 +68,26 @@ def main() -> None:
                   f"**{robust['min_pairwise_corr'].min():.3f}** "
                   f"(target >= 0.90). Per-variant event-study passes:", "",
                   robust.to_markdown(index=False)]
+    lines += ["", "## Polymarket subgraph coverage", ""]
+    cov_path = (config.DATA_DIR / "raw" / "polymarket" /
+                "volumes_coverage.csv")
+    if cov_path.exists():
+        cov = pd.read_csv(cov_path)
+        bad = cov[~cov["covered"].astype(bool)]
+        total = float(cov["gamma_lifetime_volume_usd"].sum())
+        share = float(bad["gamma_lifetime_volume_usd"].sum()) / total if total else 0.0
+        lines.append(
+            f"{len(bad)} of {len(cov)} Polymarket markets — **{share:.1%}** of "
+            f"the catalog's Gamma lifetime volume — swept less than "
+            f"{config.PM_MIN_SUBGRAPH_COVERAGE:.0%} of that volume "
+            f"(single-leg equivalent) and are excluded from the panel rather "
+            f"than recorded as $0 traded. negRisk and legacy AMM fills are "
+            f"not indexed by the orderbook subgraph; this is the size of that "
+            f"hole, and the index is a statement about the covered remainder.")
+    else:
+        lines.append("volumes_coverage.csv not found — the Polymarket volume "
+                     "sweep has not completed, so PM notional is NaN and no "
+                     "PM market is eligible.")
     lines += ["", "## Churn audit", ""]
     if churn_daily is not None:
         s = churn.shares(churn_daily)

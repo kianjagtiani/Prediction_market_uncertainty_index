@@ -57,12 +57,31 @@ GOLDSKY_SLEEP_S = 0.2
 # sweep lands within seconds) but a truncated one is days or months behind.
 GOLDSKY_MAX_CURSOR_LAG_S = 6 * 3600
 GOLDSKY_MIN_FILLS = 100_000
-# The orderbook subgraph does not index negRisk (most election markets) or
-# legacy AMM fills: pm_559700 reconciles $0 subgraph against $85k Gamma. A
-# market whose swept notional is below this fraction of its Gamma lifetime
-# volume is not "quiet", it is not covered — its days stay NaN rather than
-# being read as $0 traded. See data/raw/polymarket/volumes_coverage.csv.
-PM_MIN_SUBGRAPH_COVERAGE = 0.5
+# Coverage gate. The orderbook subgraph does not index negRisk (most
+# election markets) or legacy AMM fills: pm_559700 reconciles $0 subgraph
+# against $85k Gamma. A market whose swept notional is far below its Gamma
+# lifetime volume is not "quiet", it is not covered — its days stay NaN
+# rather than being read as $0 traded. See volumes_coverage.csv.
+#
+# Units: `assemble` sums BOTH outcome tokens of a market, Gamma's volumeNum
+# is single-legged, so the raw ratio is not a coverage fraction. The two are
+# made commensurable by dividing the swept sum by PM_TOKEN_LEGS_PER_FILL.
+# The true factor is the open I8(a) question: 1 if a matched fill is booked
+# once, 2 if it is booked against both orderbooks. 2 is the conservative
+# end — it understates coverage, so the gate errs toward excluding a market
+# rather than admitting one whose notional is understated.
+PM_TOKEN_LEGS_PER_FILL = 2
+# Threshold on that single-leg-equivalent scale. PROVISIONAL until I8(a) is
+# measured; chosen so every known data point lands on the same side for any
+# leg factor in [1, 2]. Both-leg observations from the live probe: 0.00
+# (pm_559700, negRisk), 0.06 (pm_544097), ~0.96 (a market that reconciles).
+# Single-leg those are 0.00 / 0.03 / 0.48 at factor 2 and 0.00 / 0.06 / 0.96
+# at factor 1 — 0.25 separates "not indexed" from "indexed" either way.
+PM_MIN_SUBGRAPH_COVERAGE = 0.25
+# Aggregate stop. Below this the gate repairs the panel; above it the gate
+# is deleting the venue rather than repairing it, and no index should be
+# published from whatever survives. Raises, it does not filter.
+PM_MAX_UNCOVERED_VOLUME_SHARE = 0.20
 
 INDEXES = ["GLOBAL", "WAR", "ELECTIONS", "POLITICS", "ECON_FED",
            "CRYPTO", "TECH_AI", "CLIMATE"]

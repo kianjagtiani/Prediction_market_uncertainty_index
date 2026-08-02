@@ -467,42 +467,91 @@ def assemble(out_dir: Path) -> None:
     print(f"volumes.parquet: {n_rows} market-days")
 
 
+def _sweep_vintage(out_dir: Path) -> str:
+    """The data vintage a coverage verdict was formed against: the sweep's
+    last covered day, or today if there is no manifest to name one."""
+    path = out_dir / "volumes_manifest.json"
+    if path.exists():
+        last = json.loads(path.read_text()).get("last_date")
+        if last:
+            return str(last)[:10]
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+COVERAGE_COLUMNS = ["market_id", "gamma_lifetime_volume_usd",
+                    "subgraph_notional_both_legs_usd",
+                    "subgraph_notional_usd", "coverage_single_leg",
+                    "covered", "vintage"]
+
+
 def write_coverage_report(out_dir: Path) -> None:
     """Per-market swept notional vs Gamma's lifetime volume.
 
-    The two venues' daily_notional_usd are built differently — Kalshi is
-    volume_fp * close_prob (contracts x price, one leg per market),
-    Polymarket is the USDC collateral leg of CLOB fills summed over BOTH
-    outcome tokens — and a single eligibility floor is applied to both.
-    That equality is assumed, not verified: the live probe reconciled one
-    token's sum(size) against that token's own collateralVolume, never the
-    both-token sum against a per-market ground truth.
+    Catches the known coverage hole: the subgraph does not index negRisk or
+    legacy AMM fills, and without this normalize's zero-fill would convert
+    "not indexed by this subgraph" into "genuinely zero notional", dropping
+    those markets under the liquidity floor with nothing anywhere showing
+    it. It is also the evidence trail for the open I8(a) reconciliation.
 
-    This report is the evidence trail. It also catches the known coverage
-    hole: the subgraph does not index negRisk or legacy AMM fills, and
-    without it normalize's zero-fill would convert "not indexed by this
-    subgraph" into "genuinely zero notional", dropping those markets under
-    the liquidity floor with nothing anywhere showing it.
+    Units. The numerator sums BOTH outcome tokens (`assemble`); Gamma's
+    volumeNum is single-legged. `subgraph_notional_usd` divides the swept
+    sum by config.PM_TOKEN_LEGS_PER_FILL so `coverage_single_leg` is a
+    fraction of the same quantity the denominator measures. Kalshi's
+    daily_notional_usd (volume_fp * close_prob) is single-legged too, which
+    is what makes the shared eligibility floor meaningful.
+
+    Verdicts are FROZEN per market. `total_volume_usd` is Gamma's lifetime
+    volume as of whenever the metadata crawl ran, so recomputing it would
+    let volume traded *after* a published day flip that day's eligibility on
+    the next rebuild. A market already in the report keeps its verdict and
+    its `vintage`; only markets seen for the first time are classified. The
+    file is therefore a vintaged artefact and belongs in version control
+    alongside the published index.
     """
+    path = out_dir / "volumes_coverage.csv"
     vol = pd.read_parquet(out_dir / "volumes.parquet",
                           columns=["market_id", "daily_notional_usd"])
     meta = pd.read_parquet(out_dir / "markets.parquet",
                            columns=["market_id", "total_volume_usd"])
+    prior = pd.read_csv(path) if path.exists() else None
+    if prior is not None and not set(COVERAGE_COLUMNS) <= set(prior.columns):
+        print(f"  coverage: {path.name} predates the current schema; every "
+              f"market is reclassified against this vintage", flush=True)
+        prior = None
+    known = set(prior["market_id"]) if prior is not None else set()
+
+    fresh = meta[~meta["market_id"].isin(known)]
     swept = vol.groupby("market_id")["daily_notional_usd"].sum()
-    rep = meta.assign(
-        subgraph_notional_usd=meta["market_id"].map(swept).fillna(0.0))
-    rep["coverage"] = (rep["subgraph_notional_usd"]
-                       / rep["total_volume_usd"].mask(
-                           rep["total_volume_usd"] <= 0))
-    # NaN coverage (no Gamma volume to compare against) is not evidence of
-    # coverage, and NaN >= x is already False.
-    rep["covered"] = rep["coverage"] >= config.PM_MIN_SUBGRAPH_COVERAGE
-    rep.to_csv(out_dir / "volumes_coverage.csv", index=False)
-    n_bad = int((~rep["covered"]).sum())
-    print(f"volumes_coverage.csv: {n_bad}/{len(rep)} PM markets swept less "
-          f"than {config.PM_MIN_SUBGRAPH_COVERAGE:.0%} of their Gamma "
-          f"lifetime volume; their market-days stay NaN, not $0"
-          + (" -- CHECK negRisk/AMM coverage" if n_bad else ""))
+    gamma = fresh["total_volume_usd"].astype("float64")
+    both = fresh["market_id"].map(swept).fillna(0.0).astype("float64")
+    single = both / config.PM_TOKEN_LEGS_PER_FILL
+    rep = pd.DataFrame({
+        "market_id": fresh["market_id"].values,
+        "gamma_lifetime_volume_usd": gamma.values,
+        "subgraph_notional_both_legs_usd": both.values,
+        "subgraph_notional_usd": single.values,
+        # NaN coverage (no Gamma volume to compare against) is not evidence
+        # of coverage, and NaN >= x is already False.
+        "coverage_single_leg": (single / gamma.where(gamma > 0)).values,
+        "vintage": _sweep_vintage(out_dir),
+    })
+    rep["covered"] = (rep["coverage_single_leg"]
+                      >= config.PM_MIN_SUBGRAPH_COVERAGE)
+    out = (pd.concat([prior, rep], ignore_index=True)[COVERAGE_COLUMNS]
+           if prior is not None else rep[COVERAGE_COLUMNS])
+    tmp = path.with_name(path.name + ".tmp")
+    out.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+    bad = out.loc[~out["covered"].astype(bool)]
+    total = float(out["gamma_lifetime_volume_usd"].sum())
+    share = (float(bad["gamma_lifetime_volume_usd"].sum()) / total
+             if total else 0.0)
+    print(f"volumes_coverage.csv: {len(bad)}/{len(out)} PM markets swept "
+          f"less than {config.PM_MIN_SUBGRAPH_COVERAGE:.0%} of their Gamma "
+          f"lifetime volume (single-leg), {share:.1%} of catalog volume; "
+          f"their market-days stay NaN, not $0"
+          + (" -- CHECK negRisk/AMM coverage" if len(bad) else ""))
 
 
 def _wait_for_markets(out_dir: Path) -> None:
@@ -524,9 +573,19 @@ def _wait_for_markets(out_dir: Path) -> None:
 
 
 def main(pages: int | None = None) -> bool:
-    """One portion of work. Returns True when volumes.parquet is built."""
+    """One portion of work. Returns True when both outputs are built.
+
+    Completion needs the coverage report as well as volumes.parquet: it is
+    written after assemble publishes the parquet, so a kill in between (the
+    RSS watchdog exits 143, which the driver reads as progress) would
+    otherwise leave a permanent state where the next portion short-circuits
+    to "complete", the report never exists, and normalize's zero-fill runs
+    unguarded — the exact laundering the report is there to prevent.
+    Re-running assemble to recover is idempotent and cheap.
+    """
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    if (OUT_DIR / "volumes.parquet").exists():
+    if ((OUT_DIR / "volumes.parquet").exists()
+            and (OUT_DIR / "volumes_coverage.csv").exists()):
         print("polymarket volume ingestion complete")
         return True
     vol = VolumeStore(OUT_DIR)
