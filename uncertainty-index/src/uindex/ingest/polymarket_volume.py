@@ -207,19 +207,24 @@ class VolumeStore:
         if not self.manifest_path.exists():
             return True  # pre-manifest data; treat as complete, defensively
         m = json.loads(self.manifest_path.read_text())
-        return m.get("endpoint", config.GOLDSKY_URL) == config.GOLDSKY_URL
+        # No default: a manifest written before Task 4 has no "endpoint"
+        # key at all, and that absence IS the old-deployment marker. A
+        # default of config.GOLDSKY_URL would make a legacy manifest read
+        # as matching whatever URL is currently configured -- exactly the
+        # case this guard exists to catch.
+        return m.get("endpoint") == config.GOLDSKY_URL
 
     def resume(self) -> tuple[dict | None, int, int]:
         default = {"cursor": None, "seq": -1, "n": 0}
         state = (json.loads(self.state_path.read_text())
                  if self.state_path.exists() else default)
         if (self.state_path.exists()
-                and state.get("endpoint", config.GOLDSKY_URL) != config.GOLDSKY_URL):
-            print(f"  volume sweep: cursor was recorded against "
-                  f"{state.get('endpoint')!r}, now sweeping "
-                  f"{config.GOLDSKY_URL!r} — a cursor from one Goldsky "
-                  f"deployment cannot resume against another; discarding "
-                  f"it and starting the sweep fresh", flush=True)
+                and state.get("endpoint") != config.GOLDSKY_URL):
+            old = state.get("endpoint") or "an unrecorded pre-Task-4 endpoint"
+            print(f"  volume sweep: cursor was recorded against {old!r}, "
+                  f"now sweeping {config.GOLDSKY_URL!r} — a cursor from one "
+                  f"Goldsky deployment cannot resume against another; "
+                  f"discarding it and starting the sweep fresh", flush=True)
             shutil.rmtree(self.parts_dir, ignore_errors=True)
             self.state_path.unlink()
             state = default

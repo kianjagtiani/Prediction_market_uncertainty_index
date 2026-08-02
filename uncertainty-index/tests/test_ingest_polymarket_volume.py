@@ -350,6 +350,44 @@ def test_complete_ignores_a_final_output_from_a_different_deployment(
     assert not store.complete  # same file on disk, different endpoint now
 
 
+def test_legacy_manifest_without_an_endpoint_key_is_not_complete(tmp_path):
+    """The real-world instance of "a different deployment": every state
+    file written by pre-Task-4 code has no "endpoint" key at all, since the
+    key didn't exist yet. That absence IS the old-deployment marker — a
+    default of the current GOLDSKY_URL would make legacy data read as
+    matching whatever is currently configured, silently reusing the frozen
+    2026-01-05 resync output under the new config."""
+    store = VolumeStore(tmp_path)
+    pd.DataFrame({"token_id": ["1"], "date": [pd.Timestamp("2024-01-01")],
+                  "notional_usd": [1.0]}).to_parquet(store.final_path,
+                                                      index=False)
+    store.manifest_path.write_text(json.dumps(
+        {"first_date": "2024-01-01T00:00:00", "last_date": "2024-01-01T00:00:00",
+         "n_fills": 1, "n_tokens": 1}))  # no "endpoint", no "stale": legacy shape
+    assert not store.complete
+
+
+def test_legacy_cursor_without_an_endpoint_key_is_discarded_not_resumed(
+        monkeypatch, tmp_path):
+    """Same real-world case for a mid-flight cursor: a pre-Task-4
+    volumes_cursor.json has no "endpoint" key, and must be discarded rather
+    than resumed — resuming it would continue the new sweep from the old
+    deployment's (ts, id) position and merge in the old shards."""
+    _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
+    store = VolumeStore(tmp_path)
+    store.state_path.write_text(json.dumps(
+        {"cursor": {"ts": "1767650745", "id": "0xold"}, "seq": 3, "n": 999}))
+    # no "endpoint" key: legacy shape, predates Task 4
+
+    new_fills = [_fill(START_TS, "0xa", "1", 1_000_000)]
+    assert pv.sweep(_FakeGoldsky(new_fills), store) is True
+    df = pd.read_parquet(store.final_path)
+    assert df["notional_usd"].sum() == pytest.approx(1.0)  # only the new fill
+    m = json.loads(store.manifest_path.read_text())
+    assert m["n_fills"] == 1  # not 1000 (999 legacy + 1 new)
+
+
 def test_build_token_map_pairs_tokens_and_keeps_unknown_yes(
         monkeypatch, tmp_path):
     _no_sleep(monkeypatch)
@@ -720,6 +758,22 @@ def test_reset_stale_assembly_leaves_a_matching_deployment_alone(tmp_path):
     pv._reset_stale_assembly(tmp_path)
     assert (tmp_path / "volumes.parquet").read_bytes() == b"fresh"
     assert (tmp_path / "volumes_coverage.csv").read_text() == "fresh"
+
+
+def test_reset_stale_assembly_discards_a_legacy_manifest_without_endpoint(
+        tmp_path):
+    """The real-world instance: a pre-Task-4 volumes_manifest.json has no
+    "endpoint" key at all. That must be treated as a different deployment,
+    not as a match for whatever GOLDSKY_URL is currently configured."""
+    (tmp_path / "volumes.parquet").write_bytes(b"stale")
+    (tmp_path / "volumes_coverage.csv").write_text("stale")
+    (tmp_path / "volumes_manifest.json").write_text(json.dumps(
+        {"first_date": "2024-01-01T00:00:00", "last_date": "2024-01-01T00:00:00",
+         "n_fills": 1, "n_tokens": 1}))  # no "endpoint": legacy shape
+
+    pv._reset_stale_assembly(tmp_path)
+    assert not (tmp_path / "volumes.parquet").exists()
+    assert not (tmp_path / "volumes_coverage.csv").exists()
 
 
 def test_uncovered_markets_are_never_zero_filled():
