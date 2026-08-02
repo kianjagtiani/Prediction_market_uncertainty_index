@@ -38,6 +38,21 @@ def volume_coverage(raw_dir) -> tuple[pd.Timestamp, pd.Timestamp] | None:
     return pd.Timestamp(m["first_date"]), pd.Timestamp(m["last_date"])
 
 
+def volume_is_stale(raw_dir) -> bool:
+    """Was the sweep's manifest recorded complete-but-stale (Task 4 item 3:
+    the cursor's horizon was more than config.STALENESS_DAYS behind "now"
+    when the sweep finalized, e.g. orderbook-subgraph's documented
+    2026-04-28 freeze)? Purely informational — the NaN-tail discipline in
+    build_panel already applies regardless of this flag via
+    volume_coverage's last_date — this is what makes the condition visible
+    in a rebuild's own output rather than only inferable from the gap
+    between last_date and today."""
+    path = Path(raw_dir) / "polymarket" / "volumes_manifest.json"
+    if not path.exists():
+        return False
+    return bool(json.loads(path.read_text()).get("stale", False))
+
+
 class CoverageError(RuntimeError):
     """The coverage gate would exclude so much of Polymarket that it is
     deleting the venue rather than repairing it."""
@@ -136,6 +151,14 @@ def main() -> None:
     if pm_volumes is None:
         print("WARNING: polymarket volumes.parquet missing - PM "
               "daily_notional_usd stays NaN (run ingest.polymarket_volume)")
+    elif volume_is_stale(raw):
+        coverage = volume_coverage(raw)
+        last = coverage[1].date() if coverage else "unknown"
+        print(f"WARNING: polymarket volume sweep is complete-but-stale "
+              f"(manifest['stale'] = true, horizon ends {last}) - PM "
+              f"market-days after that date stay NaN, and universe carries "
+              f"the last in-coverage rolling notional forward (flagged "
+              f"volume_stale)")
 
     meta, panel, dropped = build_panel(
         pd.read_parquet(raw / "polymarket" / "markets.parquet"),

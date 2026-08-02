@@ -1,32 +1,82 @@
 """Polymarket PIT daily notional via the Goldsky orderbook subgraph.
 
-Sweeps `enrichedOrderFilleds` globally in (timestamp, id) order, buckets
-fills to (token_id, UTC day, notional_usd) aggregate shards on disk, maps
-tokens to our market ids, and sums both outcome tokens per market-day into
+Sweeps `orderFilledEvents` globally in (timestamp, id) order, buckets fills
+to (token_id, UTC day, notional_usd) aggregate shards on disk, maps tokens
+to our market ids, and sums both outcome tokens per market-day into
 volumes.parquet.
 
-Live-verified facts (2026-07-29, 16 probe requests):
-- `size` is the fill's USDC collateral leg scaled 1e6, NOT the token
-  quantity: over all 243 fills of one token, sum(size) == the subgraph's
-  own `orderbook.collateralVolume` (591728611) exactly, and
-  `scaledCollateralVolume` == that / 1e6 (591.728611). So
-  notional_usd = size / 1e6 and `price` plays no role (sum(size*price)
-  reconciles to nothing).
+Source (Task 4, see docs/research/negrisk-coverage-probe.md section 5):
+points at `orderbook-subgraph/0.0.1`, not the `polymarket-orderbook-resync`
+deployment swept before this task, which stopped indexing on 2026-01-05.
+`orderbook-subgraph` is a strict upgrade on every axis the probe measured
+but is itself frozen at 2026-04-28 pending a v1->v2 contract migration this
+module does not yet ingest (see config.STALENESS_DAYS and Task 8's
+methodology/limitations doc for that gap). The two deployments are NOT
+resumable against each other: VolumeStore records config.GOLDSKY_URL in its
+cursor and manifest and discards anything recorded against a different one
+(see VolumeStore.resume/complete) rather than silently truncating the new
+sweep against the old deployment's cursor.
+
+Live-verified facts:
+- (2026-07-29, 16 probe requests, prior `polymarket-orderbook-resync`
+  deployment) `size` on `enrichedOrderFilleds` is the fill's USDC collateral
+  leg scaled 1e6, NOT the token quantity: sum(size) over 243 fills of one
+  token == the subgraph's own `orderbook.collateralVolume` exactly. This
+  deployment is no longer swept; kept here because the derivation pattern
+  (collateral leg / 1e6, no role for `price`) carries over below.
+- (2026-08-02, this task, `orderbook-subgraph/0.0.1`) `orderFilledEvents`
+  has no `market { id }` join; the two legs are `makerAssetId`/
+  `takerAssetId` with `makerAmountFilled`/`takerAmountFilled`. Exactly one
+  of the two asset ids is `"0"` (the USDC-collateral leg); the OTHER one is
+  the CLOB token being traded, and the matching *Filled amount is that
+  leg's USDC notional scaled 1e6 (same rule as the old `size` field, split
+  across two named fields instead of one because there is no longer a
+  `market` join to read `size` against). Exact-sum spot-check: paged all
+  5,327 `orderFilledEvents` naming Weinstein-bucket token
+  ...3915176778714 (12 pages of <=500 rows, 0.29-0.37s each, well under the
+  30s/500-row budget), summed `makerAssetId=="0" ? makerAmountFilled :
+  takerAmountFilled` per row / 1e6 -> 6319.049035999963, against the
+  subgraph's own `orderbook(id: token).scaledCollateralVolume` ==
+  "6319.049036" and `tradesQuantity` == "5327" for the same token -- exact
+  fill-count match, dollar sum matches to the sub-cent (float summation
+  noise over 5,327 rows), confirming the scaling rule at scale, not just on
+  5 sample rows.
 - `orderBy: timestamp` results are tie-broken by id ascending, and the
   filter `{or: [{timestamp_gt: ts}, {timestamp: ts, id_gt: id}]}` resumes
-  mid-timestamp exactly (verified against an overlapping page), so a
-  (timestamp, id) cursor is lossless.
-- 1000-row pages with the nested `market { id }` join deterministically hit
-  the store's statement timeout; 500 returns in <1s, 100 in ~0.3s. Page
-  size adapts downward within a portion.
+  mid-timestamp exactly, so a (timestamp, id) cursor is lossless. Confirmed
+  again on `orderFilledEvents`: `OrderFilledEvent_filter` exposes the same
+  `id_gt`/`timestamp_gt`/`timestamp_gte`/`and`/`or` fields.
+- 1000-row pages with a nested join (the old `market { id }` lookup)
+  deterministically hit the store's statement timeout; 500 returns in <1s,
+  100 in ~0.3s. `orderFilledEvents` has no join at all and 500-row pages
+  ran in ~0.3s live, but the adaptive halving logic is kept defensively —
+  see `_fetch_fills`.
 - `marketData(id: token).condition.id` links token -> condition, and
   `marketDatas(where: {condition_in: [...]})` returns both outcome tokens
-  per condition, so the yes/no pairing needs ~2 Goldsky requests per chunk
-  of markets instead of one Gamma request per market.
-- Caveat: subgraph CLOB notional can diverge wildly from Gamma `volumeNum`
-  (pm_544097: $5,846 both tokens vs Gamma $95,320; pm_559700: $0 vs
-  $85,005) — the probe's 96% reconciliation is not universal. The index
-  uses the subgraph's PIT definition consistently.
+  per condition. Live-confirmed (2026-08-02) that `orderbook-subgraph`
+  exposes the identical `MarketData` entity (`id`, `condition`,
+  `outcomeIndex`) used by CONDITIONS_QUERY/SIBLINGS_QUERY below, so token
+  mapping needs no change for the new deployment.
+- Caveat: subgraph CLOB notional can diverge wildly from Gamma `volumeNum`,
+  and a subset of negRisk markets are indexed near 0% regardless of which
+  deployment is swept (see the probe). The index uses the subgraph's PIT
+  definition consistently; volumes_coverage.csv is the audit trail.
+
+Freshness discipline (Task 4 item 3): a sweep only finalizes as
+unconditionally complete when its cursor is within
+config.GOLDSKY_MAX_CURSOR_LAG_S of "now" (a genuinely live, caught-up
+sweep). Beyond that but within config.STALENESS_DAYS it keeps retrying
+(SweepIncompleteError) rather than guessing. Beyond STALENESS_DAYS -- which
+`orderbook-subgraph`'s documented 2026-04-28 freeze guarantees on first real
+use -- it finalizes anyway (refusing forever would mean this module never
+completes and Polymarket volume never ships) but records
+`manifest["stale"] = True`, so this is recorded as complete-but-stale, never
+silently complete. Downstream, normalize.build_panel already keeps every
+day after the manifest's `last_date` as NaN rather than $0 (see
+normalize.uncovered_markets/volume_coverage); universe.apply_pit_rules
+carries a market's last in-coverage rolling notional forward across that
+NaN tail (so the universe does not collapse to nothing once the feed goes
+stale) and marks those rows `volume_stale` in the flagged panel.
 
 Runs in bounded portions with the same exit protocol as the other ingest
 modules (exit 3 = more work, 0 = complete) so scripts/run_backfill.sh
@@ -57,10 +107,11 @@ TOKEN_MAP_CHUNK = 200
 MAX_MARKETS_WAITS = 10  # 60s polls for markets.parquet before giving up
 ASSEMBLE_BATCH_ROWS = 65_536  # rows held in RAM per assemble pass-1 batch
 
-FILLS_QUERY = """query($first: Int!, $where: EnrichedOrderFilled_filter) {
-  enrichedOrderFilleds(first: $first, orderBy: timestamp,
-                       orderDirection: asc, where: $where) {
-    id timestamp size market { id }
+FILLS_QUERY = """query($first: Int!, $where: OrderFilledEvent_filter) {
+  orderFilledEvents(first: $first, orderBy: timestamp,
+                     orderDirection: asc, where: $where) {
+    id timestamp makerAssetId takerAssetId
+    makerAmountFilled takerAmountFilled
   }
 }"""
 
@@ -106,7 +157,7 @@ def _fetch_fills(client: httpx.Client, where: dict,
     while True:
         try:
             data = _post(client, FILLS_QUERY, {"first": size, "where": where})
-            return data["enrichedOrderFilleds"], size
+            return data["orderFilledEvents"], size
         except GoldskyQueryError:
             if size <= MIN_PAGE_SIZE:
                 raise
@@ -134,7 +185,14 @@ class VolumeStore:
     cursor, but unlike MetaStore's rows, replayed *sums* can't be deduped
     away in finalize — so resume() deletes any shard newer than the
     committed sequence (a crash between shard and cursor writes) instead of
-    letting the replayed pages double-count."""
+    letting the replayed pages double-count.
+
+    Self-identifying against config.GOLDSKY_URL: both the cursor state and
+    the manifest record the endpoint they were swept against, so switching
+    subgraph deployments (Task 4: polymarket-orderbook-resync ->
+    orderbook-subgraph) can never resume a cursor, or be read as
+    `complete`, against data collected from a different deployment. The two
+    are not union-compatible sources — see the module docstring."""
 
     def __init__(self, out_dir: Path):
         self.final_path = out_dir / "volumes_by_token.parquet"
@@ -144,12 +202,27 @@ class VolumeStore:
 
     @property
     def complete(self) -> bool:
-        return self.final_path.exists()
+        if not self.final_path.exists():
+            return False
+        if not self.manifest_path.exists():
+            return True  # pre-manifest data; treat as complete, defensively
+        m = json.loads(self.manifest_path.read_text())
+        return m.get("endpoint", config.GOLDSKY_URL) == config.GOLDSKY_URL
 
     def resume(self) -> tuple[dict | None, int, int]:
+        default = {"cursor": None, "seq": -1, "n": 0}
         state = (json.loads(self.state_path.read_text())
-                 if self.state_path.exists()
-                 else {"cursor": None, "seq": -1, "n": 0})
+                 if self.state_path.exists() else default)
+        if (self.state_path.exists()
+                and state.get("endpoint", config.GOLDSKY_URL) != config.GOLDSKY_URL):
+            print(f"  volume sweep: cursor was recorded against "
+                  f"{state.get('endpoint')!r}, now sweeping "
+                  f"{config.GOLDSKY_URL!r} — a cursor from one Goldsky "
+                  f"deployment cannot resume against another; discarding "
+                  f"it and starting the sweep fresh", flush=True)
+            shutil.rmtree(self.parts_dir, ignore_errors=True)
+            self.state_path.unlink()
+            state = default
         if self.parts_dir.exists():
             for p in self.parts_dir.glob("b*/flush-*.parquet"):
                 if int(p.stem.split("-")[1]) > state["seq"]:
@@ -173,14 +246,18 @@ class VolumeStore:
                 tmp = part.with_name(part.name + ".tmp")
                 grp.to_parquet(tmp, index=False)
                 os.replace(tmp, part)
-        _write_json(self.state_path, {"cursor": cursor, "seq": seq, "n": n})
+        _write_json(self.state_path, {"cursor": cursor, "seq": seq, "n": n,
+                                      "endpoint": config.GOLDSKY_URL})
 
-    def finalize(self, n_fills: int) -> None:
+    def finalize(self, n_fills: int, stale: bool = False) -> None:
         """Merge the shards and record what the sweep actually covered.
 
         The manifest is the only thing downstream can use to tell a complete
         sweep from a truncated one: normalize refuses to read "no fills" as
-        "$0 traded" outside [first_date, last_date]."""
+        "$0 traded" outside [first_date, last_date]. `stale` means the sweep
+        reached an empty page config.STALENESS_DAYS+ behind "now" (see
+        _check_exhausted) — recorded, never silently folded into a plain
+        "complete"."""
         writer = None
         tmp = self.final_path.with_name(self.final_path.name + ".tmp")
         bdirs = (sorted(self.parts_dir.glob("b*"))
@@ -221,6 +298,8 @@ class VolumeStore:
             "last_date": max(days).isoformat() if days else None,
             "n_fills": n_fills,
             "n_tokens": n_tokens,
+            "stale": stale,
+            "endpoint": config.GOLDSKY_URL,
         })
         # State first, like MetaStore: a stale cursor must not survive.
         self.state_path.unlink(missing_ok=True)
@@ -232,21 +311,45 @@ class VolumeStore:
             self.parts_dir.rmdir()
 
 
-def _check_exhausted(cursor: dict | None, n_fills: int) -> None:
-    """A sweep is only complete if it swept a plausible number of fills AND
-    its cursor reached the present. Anything else finalizes a partial
-    history that normalize would launder into "$0 traded"."""
+def _token_and_notional(f: dict) -> tuple[str, float]:
+    """Derive (token_id, notional_usd) from one orderFilledEvents row.
+
+    `"0"` is the USDC-collateral leg; the other asset id is the CLOB token
+    traded, and that leg's own *AmountFilled is its USDC notional scaled
+    1e6 (verified exactly against Orderbook.scaledCollateralVolume for
+    5,327 fills of one token — see module docstring)."""
+    if f["makerAssetId"] == "0":
+        return f["takerAssetId"], int(f["makerAmountFilled"]) / 1e6
+    return f["makerAssetId"], int(f["takerAmountFilled"]) / 1e6
+
+
+def _check_exhausted(cursor: dict | None, n_fills: int) -> bool:
+    """A sweep is only complete if it swept a plausible number of fills.
+    Whether that completion is FRESH or STALE depends on the cursor's lag
+    behind "now" (returned): False = fresh (caught up live), True = stale
+    (accepted as the subgraph's real horizon, not a live feed — see
+    config.STALENESS_DAYS). Too few fills, or a lag that is more than a
+    guard band but not yet stale-old, raises instead: a partial history
+    must never be finalized as if it were "no more data"."""
     if n_fills < config.GOLDSKY_MIN_FILLS:
         raise SweepIncompleteError(
             f"sweep returned an empty page after only {n_fills} fills "
             f"(expected >= {config.GOLDSKY_MIN_FILLS}); the subgraph is "
             f"degraded or lagging. Cursor kept — rerun to resume.")
     lag = time.time() - int(cursor["ts"])
-    if lag > config.GOLDSKY_MAX_CURSOR_LAG_S:
+    if lag <= config.GOLDSKY_MAX_CURSOR_LAG_S:
+        return False
+    if lag <= config.STALENESS_DAYS * 86400:
         raise SweepIncompleteError(
-            f"sweep returned an empty page {lag / 86400:.1f} days behind "
-            f"now (limit {config.GOLDSKY_MAX_CURSOR_LAG_S / 3600:.0f}h); the "
-            f"remaining history is missing, not absent. Cursor kept.")
+            f"sweep returned an empty page {lag / 3600:.1f}h behind now "
+            f"(fresh-completion limit {config.GOLDSKY_MAX_CURSOR_LAG_S / 3600:.0f}h, "
+            f"accepted-as-stale limit {config.STALENESS_DAYS}d); the "
+            f"remaining history may still be catching up. Cursor kept.")
+    print(f"  volume sweep: empty page {lag / 86400:.1f} days behind now "
+          f"(> {config.STALENESS_DAYS}d staleness limit) — accepting as "
+          f"complete-but-stale, not silently complete; see "
+          f"volumes_manifest.json['stale']", flush=True)
+    return True
 
 
 def sweep(client: httpx.Client, store: VolumeStore,
@@ -268,8 +371,9 @@ def sweep(client: httpx.Client, store: VolumeStore,
     while max_pages is None or pages < max_pages:
         rows, size = _fetch_fills(client, _where(cursor), size)
         for f in rows:
-            key = (f["market"]["id"], int(f["timestamp"]) // 86400)
-            acc[key] = acc.get(key, 0.0) + int(f["size"]) / 1e6
+            token_id, notional = _token_and_notional(f)
+            key = (token_id, int(f["timestamp"]) // 86400)
+            acc[key] = acc.get(key, 0.0) + notional
         n += len(rows)
         if rows:
             cursor = {"ts": rows[-1]["timestamp"], "id": rows[-1]["id"]}
@@ -282,8 +386,8 @@ def sweep(client: httpx.Client, store: VolumeStore,
             print(f"  volume sweep: {n} fills through "
                   f"{cursor['ts'] if cursor else 'start'}", flush=True)
         if done:
-            _check_exhausted(cursor, n)
-            store.finalize(n)
+            stale = _check_exhausted(cursor, n)
+            store.finalize(n, stale)
             return True
         time.sleep(config.GOLDSKY_SLEEP_S)
     seq += 1
@@ -572,6 +676,27 @@ def _wait_for_markets(out_dir: Path) -> None:
     time.sleep(60)
 
 
+def _reset_stale_assembly(out_dir: Path) -> None:
+    """volumes.parquet and volumes_coverage.csv are downstream of the sweep
+    but not self-identifying the way VolumeStore's own cursor/manifest are
+    (see VolumeStore.resume/complete): if the manifest says the last sweep
+    was against a different Goldsky endpoint, these two must be discarded
+    too, or write_coverage_report's frozen-verdict vintaging would keep
+    classifying markets against a coverage csv computed from data that no
+    longer exists on disk."""
+    manifest = out_dir / "volumes_manifest.json"
+    if not manifest.exists():
+        return
+    if json.loads(manifest.read_text()).get("endpoint") == config.GOLDSKY_URL:
+        return
+    print(f"polymarket volume: last sweep was against a different Goldsky "
+          f"endpoint than {config.GOLDSKY_URL!r}; discarding "
+          f"volumes.parquet/volumes_coverage.csv so they are rebuilt from "
+          f"the new sweep, not the old one", flush=True)
+    (out_dir / "volumes.parquet").unlink(missing_ok=True)
+    (out_dir / "volumes_coverage.csv").unlink(missing_ok=True)
+
+
 def main(pages: int | None = None) -> bool:
     """One portion of work. Returns True when both outputs are built.
 
@@ -584,6 +709,7 @@ def main(pages: int | None = None) -> bool:
     Re-running assemble to recover is idempotent and cheap.
     """
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    _reset_stale_assembly(OUT_DIR)
     if ((OUT_DIR / "volumes.parquet").exists()
             and (OUT_DIR / "volumes_coverage.csv").exists()):
         print("polymarket volume ingestion complete")

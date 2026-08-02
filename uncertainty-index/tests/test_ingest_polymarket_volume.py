@@ -20,9 +20,18 @@ class _FakeResponse:
         return self._payload
 
 
-def _fill(ts, fid, token, size):
-    return {"id": fid, "timestamp": str(ts), "size": str(size),
-            "market": {"id": token}}
+def _fill(ts, fid, token, size, maker_zero=True):
+    """`size` is the pre-scaled (x1e6) USDC notional on whichever leg names
+    `token`. maker_zero=True puts the "0" (collateral) leg on makerAssetId,
+    as the module's live spot-check sample skewed; maker_zero=False
+    exercises the other direction (takerAssetId == "0")."""
+    if maker_zero:
+        return {"id": fid, "timestamp": str(ts), "makerAssetId": "0",
+                "takerAssetId": token, "makerAmountFilled": str(size),
+                "takerAmountFilled": "1"}
+    return {"id": fid, "timestamp": str(ts), "makerAssetId": token,
+            "takerAssetId": "0", "makerAmountFilled": "1",
+            "takerAmountFilled": str(size)}
 
 
 class _FakeGoldsky:
@@ -40,7 +49,7 @@ class _FakeGoldsky:
         assert url == config.GOLDSKY_URL
         self.calls.append(json)
         q, var = json["query"], json["variables"]
-        if "enrichedOrderFilleds" in q:
+        if "orderFilledEvents" in q:
             return self._fills_page(var)
         if "id_in" in q:
             rows = [{"id": t, "condition": {"id": self.market_datas[t]}}
@@ -67,7 +76,7 @@ class _FakeGoldsky:
             rows = [f for f in self.fills
                     if int(f["timestamp"]) >= int(w["timestamp_gte"])]
         return _FakeResponse(
-            {"data": {"enrichedOrderFilleds": rows[:var["first"]]}})
+            {"data": {"orderFilledEvents": rows[:var["first"]]}})
 
 
 START_TS = 1704067200  # config.BACKFILL_START midnight UTC
@@ -84,22 +93,42 @@ def _relax_completion_guards(monkeypatch):
     monkeypatch.setattr(config, "GOLDSKY_MAX_CURSOR_LAG_S", 10 ** 12)
 
 
-def test_notional_is_size_over_1e6_pinned_to_live_reconciliation(
+def test_notional_is_scaled_amount_pinned_to_live_reconciliation(
         monkeypatch, tmp_path):
-    # Live probe: sum(size) over all 243 fills of one token == the
-    # subgraph's own orderbook.collateralVolume == 591728611, and
-    # scaledCollateralVolume == 591.728611. So USD = size / 1e6, no price.
+    # Live spot-check (2026-08-02, orderbook-subgraph/0.0.1): paging all
+    # 5,327 orderFilledEvents naming one token and summing whichever
+    # *AmountFilled sits on the non-"0" leg / 1e6 reproduced the subgraph's
+    # own orderbook.scaledCollateralVolume (6319.049036) to sub-cent float
+    # noise. This fixture pins a smaller, exact split of that total.
     _no_sleep(monkeypatch)
     _relax_completion_guards(monkeypatch)
-    sizes = [591728611 - 39600000, 39600000]  # split of the verified total
+    sizes = [6319049036 - 39600000, 39600000]  # split of the verified total
     fills = [_fill(START_TS + i, f"0xf{i}", "7", s)
              for i, s in enumerate(sizes)]
     store = VolumeStore(tmp_path)
     assert pv.sweep(_FakeGoldsky(fills), store) is True
     df = pd.read_parquet(store.final_path)
     assert df["notional_usd"].dtype == "float64"
-    assert df["notional_usd"].sum() == pytest.approx(591.728611)
+    assert df["notional_usd"].sum() == pytest.approx(6319.049036)
     assert df.loc[0, "date"] == pd.Timestamp("2024-01-01")
+
+
+def test_asset_id_scaling_rule_both_directions(monkeypatch, tmp_path):
+    """`"0"` is the USDC leg and can sit on either side of a fill; the
+    non-"0" leg's own *AmountFilled is always the USD notional, and both
+    directions must land on the SAME token so a market's total sums
+    correctly regardless of which side the collateral leg matched on."""
+    _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
+    fills = [
+        _fill(START_TS, "0xa", "42", 4_000_000, maker_zero=True),   # "0" is maker
+        _fill(START_TS + 1, "0xb", "42", 6_000_000, maker_zero=False),  # "0" is taker
+    ]
+    store = VolumeStore(tmp_path)
+    assert pv.sweep(_FakeGoldsky(fills), store) is True
+    df = pd.read_parquet(store.final_path)
+    assert set(df["token_id"]) == {"42"}
+    assert df["notional_usd"].sum() == pytest.approx(10.0)  # 4.0 + 6.0
 
 
 def test_sweep_cursor_resumes_across_portions_without_double_count(
@@ -213,17 +242,42 @@ def test_short_page_does_not_end_the_sweep(monkeypatch, tmp_path):
     assert len(df) == 20
 
 
-def test_stale_cursor_refuses_to_finalize(monkeypatch, tmp_path):
-    """An empty page while the cursor is still months behind means the
-    remaining history is missing, not absent."""
+def test_moderately_stale_cursor_refuses_to_finalize(monkeypatch, tmp_path):
+    """An empty page behind the fresh-completion bound (GOLDSKY_MAX_CURSOR_
+    LAG_S) but still within the staleness grace period (STALENESS_DAYS)
+    means the remaining history may still be catching up, not gone — keep
+    retrying rather than guessing either way."""
     _no_sleep(monkeypatch)
     monkeypatch.setattr(config, "GOLDSKY_MIN_FILLS", 0)
+    now = START_TS + 2 * 86400  # 2 days: > 6h fresh bound, < 3d stale bound
+    monkeypatch.setattr(pv.time, "time", lambda: now)
     fills = [_fill(START_TS, "0xa", "1", 1_000_000)]
     store = VolumeStore(tmp_path)
-    with pytest.raises(pv.SweepIncompleteError, match="days behind"):
+    with pytest.raises(pv.SweepIncompleteError, match="catching up"):
         pv.sweep(_FakeGoldsky(fills), store)
     assert not store.complete
     assert (tmp_path / "volumes_cursor.json").exists()  # resumable
+
+
+def test_very_stale_cursor_finalizes_as_complete_but_stale(monkeypatch,
+                                                            tmp_path):
+    """Beyond STALENESS_DAYS this is the subgraph's real horizon (the
+    documented orderbook-subgraph freeze at 2026-04-28), not a transient
+    lag: refusing to finalize forever would mean the module never
+    completes and Polymarket volume never ships. Finalize, but record
+    stale=True so this is never confused with a live, caught-up sweep."""
+    _no_sleep(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_MIN_FILLS", 0)
+    now = START_TS + 30 * 86400  # 30 days: > 3d stale bound
+    monkeypatch.setattr(pv.time, "time", lambda: now)
+    fills = [_fill(START_TS, "0xa", "1", 1_000_000)]
+    store = VolumeStore(tmp_path)
+    assert pv.sweep(_FakeGoldsky(fills), store) is True
+    assert store.complete
+    m = json.loads(store.manifest_path.read_text())
+    assert m["stale"] is True
+    assert m["last_date"] == "2024-01-01T00:00:00"
+    assert not (tmp_path / "volumes_cursor.json").exists()
 
 
 def test_too_few_fills_refuses_to_finalize(monkeypatch, tmp_path):
@@ -247,7 +301,53 @@ def test_finalize_writes_a_coverage_manifest(monkeypatch, tmp_path):
     m = json.loads(store.manifest_path.read_text())
     assert m == {"first_date": "2024-01-01T00:00:00",
                  "last_date": "2024-01-06T00:00:00",
-                 "n_fills": 2, "n_tokens": 2}
+                 "n_fills": 2, "n_tokens": 2,
+                 "stale": False, "endpoint": config.GOLDSKY_URL}
+
+
+def test_cursor_from_old_deployment_is_discarded_not_resumed(
+        monkeypatch, tmp_path):
+    """A cursor recorded while GOLDSKY_URL pointed at a different Goldsky
+    deployment (e.g. the pre-Task-4 polymarket-orderbook-resync sweep) must
+    never be resumed against the new one — the two are unrelated indexes,
+    not a continuation of the same data."""
+    _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 1)
+    fills = [_fill(START_TS, "0xa", "1", 1_000_000)]
+    store = VolumeStore(tmp_path)
+    assert pv.sweep(_FakeGoldsky(fills), store, max_pages=1) is False
+    state = json.loads(store.state_path.read_text())
+    assert state["endpoint"] == config.GOLDSKY_URL
+
+    monkeypatch.setattr(config, "GOLDSKY_URL",
+                        "https://api.goldsky.com/.../old-deployment/gn")
+    new_fills = [_fill(START_TS, "0xa", "1", 1_000_000),
+                 _fill(START_TS + 1, "0xc", "1", 3_000_000)]
+    client = _FakeGoldsky(new_fills)
+    assert pv.sweep(client, store) is True
+    # Resumed from scratch, not from the old cursor: the very first request
+    # is a fresh timestamp_gte, not an or-cursor continuation.
+    assert "timestamp_gte" in client.calls[0]["variables"]["where"]
+    df = pd.read_parquet(store.final_path)
+    assert df["notional_usd"].sum() == pytest.approx(4.0)  # both new fills
+
+
+def test_complete_ignores_a_final_output_from_a_different_deployment(
+        monkeypatch, tmp_path):
+    """volumes_by_token.parquet finished under the old GOLDSKY_URL must not
+    read as `complete` once the config points somewhere else, or main()
+    would silently reuse a stale finished sweep forever."""
+    _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
+    store = VolumeStore(tmp_path)
+    assert pv.sweep(_FakeGoldsky([_fill(START_TS, "0xa", "1", 1_000_000)]),
+                    store) is True
+    assert store.complete
+
+    monkeypatch.setattr(config, "GOLDSKY_URL",
+                        "https://api.goldsky.com/.../a-different-one/gn")
+    assert not store.complete  # same file on disk, different endpoint now
 
 
 def test_build_token_map_pairs_tokens_and_keeps_unknown_yes(
@@ -590,6 +690,38 @@ def test_completion_needs_the_coverage_report(monkeypatch, tmp_path):
     assert (tmp_path / "volumes_coverage.csv").exists()
 
 
+def test_reset_stale_assembly_discards_output_from_an_old_deployment(
+        tmp_path):
+    """volumes.parquet and volumes_coverage.csv are not self-identifying
+    the way VolumeStore's own cursor/manifest are: a prior run that
+    finished end-to-end against an old GOLDSKY_URL must not have its
+    assembled output, or write_coverage_report's frozen verdicts, reused
+    once the config points at a different deployment."""
+    (tmp_path / "volumes.parquet").write_bytes(b"stale")
+    (tmp_path / "volumes_coverage.csv").write_text("stale")
+    (tmp_path / "volumes_manifest.json").write_text(json.dumps(
+        {"first_date": "2024-01-01T00:00:00", "last_date": "2024-01-01T00:00:00",
+         "n_fills": 1, "n_tokens": 1, "stale": False,
+         "endpoint": "https://api.goldsky.com/.../old-deployment/gn"}))
+
+    pv._reset_stale_assembly(tmp_path)
+    assert not (tmp_path / "volumes.parquet").exists()
+    assert not (tmp_path / "volumes_coverage.csv").exists()
+
+
+def test_reset_stale_assembly_leaves_a_matching_deployment_alone(tmp_path):
+    (tmp_path / "volumes.parquet").write_bytes(b"fresh")
+    (tmp_path / "volumes_coverage.csv").write_text("fresh")
+    (tmp_path / "volumes_manifest.json").write_text(json.dumps(
+        {"first_date": "2024-01-01T00:00:00", "last_date": "2024-01-01T00:00:00",
+         "n_fills": 1, "n_tokens": 1, "stale": False,
+         "endpoint": config.GOLDSKY_URL}))
+
+    pv._reset_stale_assembly(tmp_path)
+    assert (tmp_path / "volumes.parquet").read_bytes() == b"fresh"
+    assert (tmp_path / "volumes_coverage.csv").read_text() == "fresh"
+
+
 def test_uncovered_markets_are_never_zero_filled():
     _, panel, _ = normalize.build_panel(
         *_panel_inputs(), _PM_VOLUMES, _FULL_COVERAGE, {"pm_1"})
@@ -611,6 +743,23 @@ def test_volume_coverage_reads_the_sweep_manifest(tmp_path):
                                     "n_fills": 5, "n_tokens": 2}))
     assert normalize.volume_coverage(tmp_path) == (
         pd.Timestamp("2024-01-01"), pd.Timestamp("2025-03-04"))
+
+
+def test_volume_is_stale_reads_the_sweep_manifest(tmp_path):
+    pm_dir = tmp_path / "polymarket"
+    pm_dir.mkdir()
+    assert normalize.volume_is_stale(tmp_path) is False  # no manifest yet
+    manifest = pm_dir / "volumes_manifest.json"
+    manifest.write_text(json.dumps({"first_date": "2024-01-01T00:00:00",
+                                    "last_date": "2024-04-28T00:00:00",
+                                    "n_fills": 5, "n_tokens": 2,
+                                    "stale": False}))
+    assert normalize.volume_is_stale(tmp_path) is False
+    manifest.write_text(json.dumps({"first_date": "2024-01-01T00:00:00",
+                                    "last_date": "2024-04-28T00:00:00",
+                                    "n_fills": 5, "n_tokens": 2,
+                                    "stale": True}))
+    assert normalize.volume_is_stale(tmp_path) is True
 
 
 def test_build_panel_without_volumes_keeps_pm_nan():

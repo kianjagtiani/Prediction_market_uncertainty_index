@@ -342,3 +342,65 @@ def test_missing_open_date_does_not_exclude():
     meta.loc[meta["market_id"] == "pm_a", "open_date"] = pd.NaT
     out = universe.apply_pit_rules(meta, panel)
     assert out[out["market_id"] == "pm_a"]["eligible_turbulence"].any()
+
+
+def test_pm_rolling_notional_carries_forward_past_the_volume_horizon():
+    """Once the Goldsky sweep's manifest horizon passes, normalize leaves PM
+    daily_notional_usd NaN (not 0) for every later day (C1). A 7-day
+    min_periods rolling window fails the instant ANY day inside it is NaN,
+    so without a carry-forward the market would drop out of every index the
+    very next day; the last in-coverage rolling value should hold instead,
+    flagged volume_stale so it is distinguishable from a fresh one."""
+    meta, panel = _meta_panel()
+    horizon = pd.Timestamp("2024-01-20")
+    pm = panel["market_id"] == "pm_a"
+    panel.loc[pm & (panel["date"] > horizon), "daily_notional_usd"] = np.nan
+    out = universe.apply_pit_rules(meta, panel)
+    a = out[out["market_id"] == "pm_a"].set_index("date")
+
+    # Fully within coverage, window filled with real data: not stale.
+    assert a.loc[horizon, "eligible_turbulence"]
+    assert not a.loc[horizon, "volume_stale"]
+
+    # The very next day: rolling would otherwise go NaN immediately.
+    day_after = horizon + pd.Timedelta(days=1)
+    assert a.loc[day_after, "eligible_turbulence"]
+    assert a.loc[day_after, "volume_stale"]
+    assert a.loc[day_after, "weight"] == a.loc[horizon, "weight"]
+
+    # Still holds deep into the tail (short of the resolution-exclusion
+    # window near close_date, which is a separate rule entirely).
+    late = pd.Timestamp("2024-02-01")
+    assert a.loc[late, "eligible_turbulence"]
+    assert a.loc[late, "volume_stale"]
+    assert a.loc[late, "weight"] == a.loc[horizon, "weight"]
+
+
+def test_volume_stale_is_false_before_the_rolling_window_fills():
+    """The initial ramp-up (rolling not yet full) is legitimately
+    insufficient data, not a stale carry-forward, and must not be flagged
+    as one."""
+    meta, panel = _meta_panel()
+    out = universe.apply_pit_rules(meta, panel)
+    a = out[out["market_id"] == "pm_a"]
+    ramp = a[a["date"] < a["date"].min()
+            + pd.Timedelta(days=universe.config.ROLLING_WINDOW_DAYS)]
+    assert not ramp["volume_stale"].any()
+
+
+def test_kalshi_rolling_notional_is_not_carried_forward():
+    """The carry-forward is scoped to Polymarket: Kalshi's candle feed has
+    no equivalent "sweep horizon" concept, and a gap in its own data must
+    still make the market ineligible immediately, not survive on a stale
+    carried-forward number."""
+    meta, panel = _meta_panel()
+    ka = panel["market_id"] == "ka_s1"
+    panel.loc[ka, "daily_notional_usd"] = 10000.0  # clears the floor
+    gap_start = pd.Timestamp("2024-01-20")
+    panel.loc[ka & (panel["date"] > gap_start), "daily_notional_usd"] = np.nan
+    out = universe.apply_pit_rules(meta, panel)
+    k = out[out["market_id"] == "ka_s1"].set_index("date")
+    assert k.loc[gap_start, "eligible_turbulence"]
+    day_after = gap_start + pd.Timedelta(days=1)
+    assert not k.loc[day_after, "eligible_turbulence"]
+    assert not k.loc[day_after, "volume_stale"]

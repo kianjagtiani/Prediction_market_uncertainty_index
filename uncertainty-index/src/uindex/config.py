@@ -43,10 +43,19 @@ KALSHI_PAGE_SIZE = 1000
 KALSHI_CANDLE_PERIOD_INTERVAL_MINUTES = 1440
 
 # Polymarket PIT daily volume (public Goldsky orderbook subgraph; see
-# docs/research/polymarket-pit-volume-probe.md)
+# docs/research/negrisk-coverage-probe.md, section 5, for why this points at
+# orderbook-subgraph/0.0.1 (entity orderFilledEvents) rather than the
+# polymarket-orderbook-resync/prod deployment (entity enrichedOrderFilleds)
+# swept before Task 4: the resync deployment stopped indexing on 2026-01-05,
+# orderbook-subgraph is a strict upgrade (more current, no worse on any
+# sampled market) but is itself frozen at 2026-04-28 pending a v2 contract
+# migration this codebase does not yet ingest. Changing this URL changes the
+# sweep's self-identity (see polymarket_volume.VolumeStore) and discards any
+# cursor/output recorded against the old one -- the two deployments are not
+# resumable against each other.
 GOLDSKY_URL = ("https://api.goldsky.com/api/public/"
                "project_cl6mb8i9h0003e201j6li0diw/subgraphs/"
-               "polymarket-orderbook-resync/prod/gn")
+               "orderbook-subgraph/0.0.1/gn")
 GOLDSKY_PAGE_SIZE = 1000
 GOLDSKY_SLEEP_S = 0.2
 # Sweep-completion guards. The sweep is only "exhausted" when a page comes
@@ -57,6 +66,18 @@ GOLDSKY_SLEEP_S = 0.2
 # sweep lands within seconds) but a truncated one is days or months behind.
 GOLDSKY_MAX_CURSOR_LAG_S = 6 * 3600
 GOLDSKY_MIN_FILLS = 100_000
+# Staleness acceptance. orderbook-subgraph is documented frozen at
+# 2026-04-28 (see docs/research/negrisk-coverage-probe.md section 2): a real
+# sweep run today WILL exhaust with a cursor lag far beyond
+# GOLDSKY_MAX_CURSOR_LAG_S, and refusing to finalize forever would mean
+# polymarket_volume.main() never completes and Polymarket volume never
+# ships. Beyond this many days behind "now", an empty page stops being read
+# as "still catching up" (SweepIncompleteError, retry) and is instead
+# accepted as the subgraph's real horizon: the sweep finalizes with
+# manifest["stale"] = True so nothing downstream mistakes it for a live
+# feed. Between GOLDSKY_MAX_CURSOR_LAG_S and this bound stays a retry zone,
+# so a transient reindexing lag is not prematurely accepted as "the horizon".
+STALENESS_DAYS = 3
 # Coverage gate. The orderbook subgraph does not index negRisk (most
 # election markets) or legacy AMM fills: pm_559700 reconciles $0 subgraph
 # against $85k Gamma. A market whose swept notional is far below its Gamma

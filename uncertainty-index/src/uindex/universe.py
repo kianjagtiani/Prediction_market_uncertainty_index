@@ -158,6 +158,22 @@ def apply_pit_rules(meta: pd.DataFrame, panel: pd.DataFrame,
         .transform(lambda s: s.rolling(p["rolling_window_days"],
                                        min_periods=p["rolling_window_days"]).mean())
     )
+    # Polymarket only: the Goldsky sweep's manifest horizon can sit behind
+    # "today" by design (a frozen upstream subgraph -- see
+    # config.STALENESS_DAYS and ingest.polymarket_volume's module
+    # docstring), while Kalshi's candle feed has no equivalent gap. Once
+    # daily_notional_usd goes NaN past that horizon (normalize.build_panel
+    # already keeps it NaN, never 0 -- see C1), the plain rolling mean
+    # above starves of observations and every PM market would eventually
+    # drop out of every index. Carry the last in-coverage rolling value
+    # forward causally instead so the universe does not collapse to
+    # nothing, and flag it: a carried-forward number reflects trading
+    # activity as of the horizon, not today, and must be distinguishable
+    # from a freshly observed one downstream.
+    is_pm = df["venue"] == "polymarket"
+    carried_forward = rolling.where(is_pm).groupby(df["market_id"]).ffill()
+    df["volume_stale"] = is_pm & rolling.isna() & carried_forward.notna()
+    rolling = rolling.where(~df["volume_stale"], carried_forward)
     floor = np.where(df["venue"] == "polymarket",
                      p["pm_min_rolling_notional"], p["ka_min_rolling_notional"])
     eligible &= rolling >= floor
