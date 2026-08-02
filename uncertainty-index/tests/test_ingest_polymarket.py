@@ -138,18 +138,23 @@ def test_crawl_markets_raises_when_pagination_stuck(monkeypatch, tmp_path):
 
 
 class _FakeMarketsClient:
-    """Serves /markets?id=...&closed=... from a scripted {id: (market, closed)}
-    map; a request only returns markets whose tagged closed-state matches."""
+    """Serves /markets?id=...&closed=...&limit=... from a scripted
+    {id: (market, closed)} map; a request only returns markets whose
+    tagged closed-state matches. Validates the limit fetch_legacy_batch is
+    required to send (len(ids) + 1) unless disabled for a dedicated test."""
 
-    def __init__(self, markets=None):
+    def __init__(self, markets=None, check_limit=True):
         self.calls = []
         self._markets = markets or {}  # id (int) -> (api_market_dict, "true"|"false")
+        self._check_limit = check_limit
 
     def get(self, url, params):
         assert url == pm.GAMMA_MARKETS_URL
         self.calls.append(params)
         assert len(params["id"]) <= pm.LEGACY_BATCH
         assert params["end_date_min"] == pm.config.BACKFILL_START
+        if self._check_limit:
+            assert params["limit"] == len(params["id"]) + 1
         closed = params["closed"]
         found = [m for i in params["id"]
                 if (entry := self._markets.get(i)) and entry[1] == closed
@@ -166,6 +171,7 @@ def test_fetch_legacy_batch_unions_both_closed_states(monkeypatch):
     out = pm.fetch_legacy_batch(client, [1, 2, 3])
     assert {m["id"] for m in out} == {"1", "2"}
     assert [c["closed"] for c in client.calls] == ["true", "false"]
+    assert all(c["limit"] == 4 for c in client.calls)  # len([1,2,3]) + 1
 
 
 def test_fetch_legacy_batch_dedups_id_seen_in_both_responses(monkeypatch):
@@ -179,6 +185,30 @@ def test_fetch_legacy_batch_dedups_id_seen_in_both_responses(monkeypatch):
                         lambda url, params: _FakeResponse([m]))
     out = pm.fetch_legacy_batch(client, [1])
     assert len(out) == 1
+
+
+def test_fetch_legacy_batch_empty_ids_raises(monkeypatch):
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    with pytest.raises(ValueError, match="empty"):
+        pm.fetch_legacy_batch(_FakeMarketsClient(), [])
+
+
+def test_fetch_legacy_batch_raises_on_probable_truncation(monkeypatch):
+    # A response naming as many markets as the id set itself (or more) can
+    # only mean the server truncated it, since a K-id query can match at
+    # most K real markets -- this must never be silently trusted.
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    ids = [1, 2, 3]
+
+    class _TruncatingClient:
+        def get(self, url, params):
+            # Returns exactly `limit` markets regardless of which ids were
+            # asked for, simulating a server-side page cap.
+            return _FakeResponse([_api_market(str(i))
+                                  for i in range(params["limit"])])
+
+    with pytest.raises(RuntimeError, match="truncation"):
+        pm.fetch_legacy_batch(_TruncatingClient(), ids)
 
 
 def test_crawl_legacy_markets_sweeps_full_range_and_finalizes(monkeypatch, tmp_path):
@@ -199,6 +229,20 @@ def test_crawl_legacy_markets_sweeps_full_range_and_finalizes(monkeypatch, tmp_p
     # 3 batches (1-2, 3-4, 5) x 2 closed states each.
     assert len(client.calls) == 6
     assert max(i for c in client.calls for i in c["id"]) == 5
+
+
+def test_crawl_legacy_markets_no_redundant_loop_level_throttle(monkeypatch, tmp_path):
+    # fetch_legacy_batch already sleeps after each of its 2 requests; a
+    # third, loop-level sleep per batch would silently double the gap
+    # between batches without adding real throttling.
+    sleeps = []
+    monkeypatch.setattr(pm.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(pm, "LEGACY_MAX_ID", 6)
+    monkeypatch.setattr(pm, "LEGACY_BATCH", 2)
+    store = MetaStore(tmp_path)
+    assert pm.crawl_legacy_markets(_FakeMarketsClient({}), store) is True
+    # 3 batches x 2 Gamma requests/batch = 6 sleeps, not 9.
+    assert len(sleeps) == 6
 
 
 def test_crawl_legacy_markets_all_empty_batches_still_progress(monkeypatch, tmp_path):
@@ -264,6 +308,54 @@ def test_crawl_legacy_markets_keep_filter_drops_dead_markets(monkeypatch, tmp_pa
     assert list(df["market_id"]) == ["pm_2"]
 
 
+def test_crawl_legacy_markets_defensive_guard_on_out_of_range_cursor(
+        monkeypatch, tmp_path):
+    # A resume cursor already beyond LEGACY_MAX_ID (corrupted state, or a
+    # LEGACY_MAX_ID lowered after the fact) must finalize as "done" rather
+    # than build an empty id list and send an unfiltered /markets query.
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(pm, "LEGACY_MAX_ID", 5)
+    store = MetaStore(tmp_path)
+    store.commit(pd.DataFrame(columns=pm.MARKETS_COLUMNS), cursor=10, n_seen=0)
+
+    client = _FakeMarketsClient({})
+    assert pm.crawl_legacy_markets(client, store) is True
+    assert client.calls == []
+    assert store.complete
+
+
+def test_verify_legacy_completeness_passes_when_floor_and_spot_check_ok(
+        monkeypatch, tmp_path):
+    monkeypatch.setattr(pm, "LEGACY_MIN_KEPT_MARKETS", 1)
+    monkeypatch.setattr(pm, "LEGACY_SPOT_CHECK_IDS", [1])
+    pd.DataFrame({"market_id": ["pm_1"]}).to_parquet(
+        tmp_path / "markets.parquet", index=False)
+    client = _FakeMarketsClient({1: (_api_market("1"), "true")})
+    pm.verify_legacy_completeness(client, MetaStore(tmp_path))  # no raise
+
+
+def test_verify_legacy_completeness_raises_below_row_floor(monkeypatch, tmp_path):
+    monkeypatch.setattr(pm, "LEGACY_MIN_KEPT_MARKETS", 100)
+    pd.DataFrame({"market_id": ["pm_1"]}).to_parquet(
+        tmp_path / "markets.parquet", index=False)
+    with pytest.raises(RuntimeError, match="incomplete"):
+        pm.verify_legacy_completeness(_FakeMarketsClient({}), MetaStore(tmp_path))
+
+
+def test_verify_legacy_completeness_raises_when_spot_check_id_missing(
+        monkeypatch, tmp_path):
+    # The catalog clears the row floor but is missing a specific known,
+    # currently-live market -- exactly the "batch under-returned" failure
+    # mode this check exists to catch even when the count looks fine.
+    monkeypatch.setattr(pm, "LEGACY_MIN_KEPT_MARKETS", 1)
+    monkeypatch.setattr(pm, "LEGACY_SPOT_CHECK_IDS", [1])
+    pd.DataFrame({"market_id": ["pm_2"]}).to_parquet(
+        tmp_path / "markets.parquet", index=False)
+    client = _FakeMarketsClient({1: (_api_market("1"), "true")})
+    with pytest.raises(RuntimeError, match="missing"):
+        pm.verify_legacy_completeness(client, MetaStore(tmp_path))
+
+
 def _write_markets_parquet(path, market_ids, question_prefix="q"):
     pd.DataFrame({
         "market_id": market_ids, "venue": "polymarket",
@@ -323,6 +415,71 @@ def test_merge_legacy_markets_idempotent_rerun_before_flag(tmp_path):
     assert not df.duplicated("market_id").any()
 
 
+def test_merge_legacy_markets_invalidation_precedes_catalog_merge(monkeypatch, tmp_path):
+    # Regression: invalidation must happen BEFORE _stream_merge updates
+    # markets.parquet. If it ran after, a crash between a successful merge
+    # and the (not-yet-run) deletion would leave markets.parquet already
+    # grown but the volume files stale; a retry's "added" check, now
+    # computed against the already-merged catalog, would see nothing new
+    # and skip the deletion forever.
+    main_final = tmp_path / "markets.parquet"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    _write_markets_parquet(main_final, ["pm_100"])
+    _write_markets_parquet(legacy_dir / "markets.parquet", ["pm_1"])
+    flag = tmp_path / "markets_legacy_merged.flag"
+    for name in pm.VOLUME_CATALOG_DERIVED_FILES:
+        (tmp_path / name).write_text("stale")
+
+    def crash(sources, final_path, key):
+        raise RuntimeError("simulated crash mid-merge")
+    monkeypatch.setattr(pm, "_stream_merge", crash)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        pm.merge_legacy_markets(MetaStore(legacy_dir), main_final, flag)
+
+    # Deletion already happened even though the merge itself never
+    # completed and the catalog on disk is unchanged.
+    for name in pm.VOLUME_CATALOG_DERIVED_FILES:
+        assert not (tmp_path / name).exists()
+    assert sorted(pd.read_parquet(main_final)["market_id"]) == ["pm_100"]
+
+
+def test_merge_legacy_markets_invalidates_volume_artifacts_when_rows_added(tmp_path):
+    main_final = tmp_path / "markets.parquet"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    _write_markets_parquet(main_final, ["pm_100"])
+    _write_markets_parquet(legacy_dir / "markets.parquet", ["pm_1"])
+    flag = tmp_path / "markets_legacy_merged.flag"
+    for name in pm.VOLUME_CATALOG_DERIVED_FILES:
+        (tmp_path / name).write_text("stale")
+
+    pm.merge_legacy_markets(MetaStore(legacy_dir), main_final, flag)
+
+    for name in pm.VOLUME_CATALOG_DERIVED_FILES:
+        assert not (tmp_path / name).exists(), f"{name} should be invalidated"
+
+
+def test_merge_legacy_markets_leaves_volume_artifacts_when_nothing_added(tmp_path):
+    # A merge that adds no new market_id (idempotent re-run, or a legacy
+    # catalog fully subsumed by what's already there) must not force an
+    # unnecessary multi-hour polymarket_volume re-sweep.
+    main_final = tmp_path / "markets.parquet"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    _write_markets_parquet(main_final, ["pm_100", "pm_1"])
+    _write_markets_parquet(legacy_dir / "markets.parquet", ["pm_1"])
+    flag = tmp_path / "markets_legacy_merged.flag"
+    for name in pm.VOLUME_CATALOG_DERIVED_FILES:
+        (tmp_path / name).write_text("fresh")
+
+    pm.merge_legacy_markets(MetaStore(legacy_dir), main_final, flag)
+
+    for name in pm.VOLUME_CATALOG_DERIVED_FILES:
+        assert (tmp_path / name).read_text() == "fresh"
+
+
 def test_main_legacy_sweep_and_merge_feed_price_phase(monkeypatch, tmp_path):
     # End-to-end: keyset already "complete", legacy sweep runs, merges into
     # markets.parquet, and the price phase -- run fresh each portion --
@@ -331,6 +488,8 @@ def test_main_legacy_sweep_and_merge_feed_price_phase(monkeypatch, tmp_path):
     monkeypatch.setattr(pm.time, "sleep", lambda s: None)
     monkeypatch.setattr(pm, "LEGACY_MAX_ID", 5)
     monkeypatch.setattr(pm, "LEGACY_BATCH", 2)
+    monkeypatch.setattr(pm, "LEGACY_MIN_KEPT_MARKETS", 1)
+    monkeypatch.setattr(pm, "LEGACY_SPOT_CHECK_IDS", [3])
     _write_markets_parquet(tmp_path / "markets.parquet", ["pm_100"])
 
     def fake_fetch_legacy_batch(client, ids):
