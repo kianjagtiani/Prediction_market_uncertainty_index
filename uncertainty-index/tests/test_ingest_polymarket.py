@@ -137,6 +137,228 @@ def test_crawl_markets_raises_when_pagination_stuck(monkeypatch, tmp_path):
         pm.crawl_markets(client, MetaStore(tmp_path))
 
 
+class _FakeMarketsClient:
+    """Serves /markets?id=...&closed=... from a scripted {id: (market, closed)}
+    map; a request only returns markets whose tagged closed-state matches."""
+
+    def __init__(self, markets=None):
+        self.calls = []
+        self._markets = markets or {}  # id (int) -> (api_market_dict, "true"|"false")
+
+    def get(self, url, params):
+        assert url == pm.GAMMA_MARKETS_URL
+        self.calls.append(params)
+        assert len(params["id"]) <= pm.LEGACY_BATCH
+        assert params["end_date_min"] == pm.config.BACKFILL_START
+        closed = params["closed"]
+        found = [m for i in params["id"]
+                if (entry := self._markets.get(i)) and entry[1] == closed
+                for m in [entry[0]]]
+        return _FakeResponse(found)
+
+
+def test_fetch_legacy_batch_unions_both_closed_states(monkeypatch):
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    client = _FakeMarketsClient({
+        1: (_api_market("1"), "true"),
+        2: (_api_market("2"), "false"),
+    })
+    out = pm.fetch_legacy_batch(client, [1, 2, 3])
+    assert {m["id"] for m in out} == {"1", "2"}
+    assert [c["closed"] for c in client.calls] == ["true", "false"]
+
+
+def test_fetch_legacy_batch_dedups_id_seen_in_both_responses(monkeypatch):
+    # Defensive: a market shouldn't be both closed and open, but the union
+    # must not double-count it if it somehow is.
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    m = _api_market("1")
+    client = _FakeMarketsClient({1: (m, "true")})
+    # Force both passes to return the same market regardless of closed state.
+    monkeypatch.setattr(client, "get",
+                        lambda url, params: _FakeResponse([m]))
+    out = pm.fetch_legacy_batch(client, [1])
+    assert len(out) == 1
+
+
+def test_crawl_legacy_markets_sweeps_full_range_and_finalizes(monkeypatch, tmp_path):
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(pm, "LEGACY_MAX_ID", 5)
+    monkeypatch.setattr(pm, "LEGACY_BATCH", 2)
+    client = _FakeMarketsClient({
+        1: (_api_market("1"), "true"),
+        3: (_api_market("3"), "true"),
+        5: (_api_market("5"), "true"),
+    })
+    store = MetaStore(tmp_path)
+    assert pm.crawl_legacy_markets(client, store) is True
+
+    df = pd.read_parquet(tmp_path / "markets.parquet")
+    assert set(df["market_id"]) == {"pm_1", "pm_3", "pm_5"}
+    assert not (tmp_path / "markets_cursor.json").exists()
+    # 3 batches (1-2, 3-4, 5) x 2 closed states each.
+    assert len(client.calls) == 6
+    assert max(i for c in client.calls for i in c["id"]) == 5
+
+
+def test_crawl_legacy_markets_all_empty_batches_still_progress(monkeypatch, tmp_path):
+    # Most of the id space is sparse: a batch with zero hits must not be
+    # mistaken for "catalog exhausted" (that rule is right for keyset,
+    # wrong here -- see crawl_legacy_markets docstring).
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(pm, "LEGACY_MAX_ID", 6)
+    monkeypatch.setattr(pm, "LEGACY_BATCH", 2)
+    client = _FakeMarketsClient({6: (_api_market("6"), "true")})
+    store = MetaStore(tmp_path)
+    assert pm.crawl_legacy_markets(client, store) is True
+    df = pd.read_parquet(tmp_path / "markets.parquet")
+    assert list(df["market_id"]) == ["pm_6"]
+    assert len(client.calls) == 6  # 3 batches x 2 closed states
+
+
+def test_crawl_legacy_markets_watermark_resume(monkeypatch, tmp_path):
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(pm, "LEGACY_MAX_ID", 6)
+    monkeypatch.setattr(pm, "LEGACY_BATCH", 2)
+    markets = {
+        1: (_api_market("1"), "true"),
+        3: (_api_market("3"), "true"),
+        5: (_api_market("5"), "true"),
+    }
+    store = MetaStore(tmp_path)
+    assert pm.crawl_legacy_markets(_FakeMarketsClient(markets), store,
+                                   max_batches=1) is False
+    assert not store.complete
+
+    client = _FakeMarketsClient(markets)
+    assert pm.crawl_legacy_markets(client, MetaStore(tmp_path)) is True
+    # ids 1-2 already swept; resume must start at 3, not refetch 1-2.
+    assert all(i >= 3 for c in client.calls for i in c["id"])
+    df = pd.read_parquet(tmp_path / "markets.parquet")
+    assert set(df["market_id"]) == {"pm_1", "pm_3", "pm_5"}
+
+
+def test_crawl_legacy_markets_never_requests_past_max_id(monkeypatch, tmp_path):
+    # LEGACY_MAX_ID not a multiple of LEGACY_BATCH: the last batch must be
+    # short, never spilling into keyset's id space.
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(pm, "LEGACY_MAX_ID", 5)
+    monkeypatch.setattr(pm, "LEGACY_BATCH", 3)
+    client = _FakeMarketsClient({})
+    store = MetaStore(tmp_path)
+    assert pm.crawl_legacy_markets(client, store) is True
+    assert max(i for c in client.calls for i in c["id"]) == 5
+
+
+def test_crawl_legacy_markets_keep_filter_drops_dead_markets(monkeypatch, tmp_path):
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(pm, "LEGACY_MAX_ID", 2)
+    monkeypatch.setattr(pm, "LEGACY_BATCH", 2)
+    client = _FakeMarketsClient({
+        1: (_api_market("1", volume=10.0), "true"),
+        2: (_api_market("2"), "true"),
+    })
+    store = MetaStore(tmp_path)
+    assert pm.crawl_legacy_markets(client, store) is True
+    df = pd.read_parquet(tmp_path / "markets.parquet")
+    assert list(df["market_id"]) == ["pm_2"]
+
+
+def _write_markets_parquet(path, market_ids, question_prefix="q"):
+    pd.DataFrame({
+        "market_id": market_ids, "venue": "polymarket",
+        "question": [f"{question_prefix}{m}" for m in market_ids],
+        "venue_category": "", "yes_token_id": [f"{m}00" for m in market_ids],
+        "total_volume_usd": 100_000.0,
+        "open_date": pd.Timestamp("2024-01-01"),
+        "close_date": pd.Timestamp("2024-06-01"),
+    }).to_parquet(path, index=False)
+
+
+def test_merge_legacy_markets_unions_distinct_markets(tmp_path):
+    main_final = tmp_path / "markets.parquet"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    _write_markets_parquet(main_final, ["pm_100"])
+    _write_markets_parquet(legacy_dir / "markets.parquet", ["pm_1", "pm_2"])
+    flag = tmp_path / "markets_legacy_merged.flag"
+
+    pm.merge_legacy_markets(MetaStore(legacy_dir), main_final, flag)
+
+    df = pd.read_parquet(main_final)
+    assert set(df["market_id"]) == {"pm_100", "pm_1", "pm_2"}
+    assert flag.exists()
+
+
+def test_merge_legacy_markets_prefers_main_catalog_on_id_collision(tmp_path):
+    main_final = tmp_path / "markets.parquet"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    _write_markets_parquet(main_final, ["pm_1"], question_prefix="keyset-")
+    _write_markets_parquet(legacy_dir / "markets.parquet", ["pm_1"],
+                           question_prefix="legacy-")
+    flag = tmp_path / "markets_legacy_merged.flag"
+
+    pm.merge_legacy_markets(MetaStore(legacy_dir), main_final, flag)
+
+    df = pd.read_parquet(main_final)
+    assert len(df) == 1
+    assert df.iloc[0]["question"] == "keyset-pm_1"
+
+
+def test_merge_legacy_markets_idempotent_rerun_before_flag(tmp_path):
+    main_final = tmp_path / "markets.parquet"
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    _write_markets_parquet(main_final, ["pm_100"])
+    _write_markets_parquet(legacy_dir / "markets.parquet", ["pm_1"])
+    flag = tmp_path / "markets_legacy_merged.flag"
+
+    legacy_store = MetaStore(legacy_dir)
+    pm.merge_legacy_markets(legacy_store, main_final, flag)
+    pm.merge_legacy_markets(legacy_store, main_final, flag)  # crash-resume replay
+
+    df = pd.read_parquet(main_final)
+    assert sorted(df["market_id"]) == ["pm_1", "pm_100"]
+    assert not df.duplicated("market_id").any()
+
+
+def test_main_legacy_sweep_and_merge_feed_price_phase(monkeypatch, tmp_path):
+    # End-to-end: keyset already "complete", legacy sweep runs, merges into
+    # markets.parquet, and the price phase -- run fresh each portion --
+    # must pick up the newly merged legacy market without any special-case.
+    monkeypatch.setattr(pm, "OUT_DIR", tmp_path)
+    monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    monkeypatch.setattr(pm, "LEGACY_MAX_ID", 5)
+    monkeypatch.setattr(pm, "LEGACY_BATCH", 2)
+    _write_markets_parquet(tmp_path / "markets.parquet", ["pm_100"])
+
+    def fake_fetch_legacy_batch(client, ids):
+        return [_api_market("3")] if 3 in ids else []
+    monkeypatch.setattr(pm, "fetch_legacy_batch", fake_fetch_legacy_batch)
+
+    fetched = []
+
+    def fake_fetch_history(client, token_id):
+        fetched.append(token_id)
+        return {"history": [{"t": 1704067200, "p": 0.4}]}
+    monkeypatch.setattr(pm, "fetch_history", fake_fetch_history)
+
+    done = False
+    guard = 0
+    while not done:
+        guard += 1
+        assert guard < 50, "main() did not converge"
+        done = pm.main(markets=10, legacy_batches=1)
+
+    markets_df = pd.read_parquet(tmp_path / "markets.parquet")
+    assert set(markets_df["market_id"]) == {"pm_100", "pm_3"}
+    prices_df = pd.read_parquet(tmp_path / "prices.parquet")
+    assert set(prices_df["market_id"]) == {"pm_100", "pm_3"}
+    assert (tmp_path / "markets_legacy_merged.flag").exists()
+    assert (tmp_path / "legacy" / "markets.parquet").exists()
+
+
 def test_history_todo_skips_done_and_below_slack_floor():
     from uindex import config
     # Fetch extends to floor/slack so robustness sweeps that lower the
@@ -162,6 +384,12 @@ def _portion_env(monkeypatch, tmp_path, statuses):
     """Wire main() to tmp dirs with scripted per-market HTTP outcomes."""
     monkeypatch.setattr(pm, "OUT_DIR", tmp_path)
     monkeypatch.setattr(pm.time, "sleep", lambda s: None)
+    # Pre-mark the legacy phase complete+merged so these price-phase-only
+    # tests don't fall through to a real (unmocked) legacy Gamma crawl.
+    (tmp_path / "legacy").mkdir(exist_ok=True)
+    pd.DataFrame(columns=pm.MARKETS_COLUMNS).to_parquet(
+        tmp_path / "legacy" / "markets.parquet", index=False)
+    (tmp_path / "markets_legacy_merged.flag").write_text("")
     pd.DataFrame({
         "market_id": [f"pm_{i}" for i in range(len(statuses))],
         "venue": "polymarket", "question": "q", "venue_category": "",
