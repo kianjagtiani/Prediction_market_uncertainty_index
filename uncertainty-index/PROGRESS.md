@@ -231,6 +231,12 @@ Carried from review rounds; each was ruled non-blocking at the time.
 - Phase 2 spec: `docs/specs/2026-07-29-phase2-site-design.md`
 - negRisk probe (§5 is the volume-source spec):
   `docs/research/negrisk-coverage-probe.md`
-- Goldsky timeout analysis + per-task reports and the SDD ledger:
-  `.superpowers/sdd/2026-08-01-overnight-completion/`
+- Goldsky timeout analysis: `docs/research/goldsky-pagination-timeout.md`
+  (committed — the authoritative copy)
+- Per-task implementer reports, review diffs, and the SDD ledger live in
+  `.superpowers/sdd/2026-08-01-overnight-completion/` inside the
+  `finish-overnight` worktree. That directory is **git-ignored scratch**
+  and disappears if the worktree is removed. Nothing load-bearing depends
+  on it — the substance is in this file and in the commit history — but
+  keep the worktree if you want the review trail.
 - VIX/EPU adoption playbook: `docs/research/vix-adoption-history.md`
