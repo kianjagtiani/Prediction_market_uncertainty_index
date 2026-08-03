@@ -36,8 +36,15 @@ def _fill(ts, fid, token, size, maker_zero=True):
 
 class _FakeGoldsky:
     """Scripted GraphQL endpoint replicating the live-verified semantics:
-    orderBy timestamp with id tie-break, or-cursor continuation, and the
-    statement-timeout failure for pages above fail_above rows."""
+    orderBy timestamp with id tie-break, the two sargable cursor
+    continuations, and the statement-timeout failure for pages above
+    fail_above rows.
+
+    Rejecting `or` is not pedantry: live (2026-08-03) a bare `or` keyset is
+    unsargable on this store, costs time linear in scan depth and returns
+    `statement timeout` for EVERY cursor past 2024-10 — it stalled the real
+    sweep at 3.57M fills. Emitting one again is the regression this guards.
+    """
 
     def __init__(self, fills=(), market_datas=None, fail_above=None):
         self.fills = sorted(fills, key=lambda f: (int(f["timestamp"]), f["id"]))
@@ -67,14 +74,17 @@ class _FakeGoldsky:
             return _FakeResponse(
                 {"errors": [{"message": "statement timeout"}]})
         w = var["where"]
-        if "or" in w:
-            gt, eq = w["or"]
-            key = (int(gt["timestamp_gt"]), eq["id_gt"])
-            rows = [f for f in self.fills
-                    if (int(f["timestamp"]), f["id"]) > key]
-        else:
+        assert "or" not in w, f"unsargable `or` keyset reached the store: {w}"
+        if "timestamp_gte" in w:  # sweep start
             rows = [f for f in self.fills
                     if int(f["timestamp"]) >= int(w["timestamp_gte"])]
+        elif "timestamp_gt" in w:  # strictly after the cursor's timestamp
+            rows = [f for f in self.fills
+                    if int(f["timestamp"]) > int(w["timestamp_gt"])]
+        else:  # drain the cursor's own timestamp
+            rows = [f for f in self.fills
+                    if int(f["timestamp"]) == int(w["timestamp"])
+                    and f["id"] > w["id_gt"]]
         return _FakeResponse(
             {"data": {"orderFilledEvents": rows[:var["first"]]}})
 
@@ -147,9 +157,9 @@ def test_sweep_cursor_resumes_across_portions_without_double_count(
 
     client = _FakeGoldsky(fills)
     assert pv.sweep(client, VolumeStore(tmp_path)) is True
-    w = client.calls[0]["variables"]["where"]  # resumed via or-cursor
-    assert w["or"][0]["timestamp_gt"] == str(START_TS)
-    assert w["or"][1]["id_gt"] == "0xb"
+    # resumed by draining the cursor's own timestamp first, sargably
+    assert client.calls[0]["variables"]["where"] == {
+        "timestamp": str(START_TS), "id_gt": "0xb"}
     df = pd.read_parquet(tmp_path / "volumes_by_token.parquet")
     assert df["notional_usd"].sum() == pytest.approx(7.0)  # no replay
     assert len(df) == 2  # two distinct days
@@ -215,6 +225,164 @@ def test_page_size_raises_at_floor(monkeypatch, tmp_path):
     client = _FakeGoldsky([], fail_above=0)
     with pytest.raises(pv.GoldskyQueryError):
         pv.sweep(client, VolumeStore(tmp_path))
+
+
+class _OrKeysetTimesOut(_FakeGoldsky):
+    """The live failure, reproduced: a store on which the unsargable `or`
+    keyset ALWAYS times out (as it did past every 2024-10 cursor), while
+    the sargable forms serve normally at any depth."""
+
+    def _fills_page(self, var):
+        if "or" in var["where"]:
+            return _FakeResponse({"errors": [{"message": (
+                "Failed to get entities from store: canceling statement "
+                "due to statement timeout")}]})
+        return super()._fills_page(var)
+
+
+def test_sweep_survives_a_store_where_the_or_keyset_always_times_out(
+        monkeypatch, tmp_path):
+    """The regression that stalled the real sweep at 3.57M fills. The `or`
+    keyset resumes at the right row but is unsargable: the store scans from
+    the start of the table and discards everything before the cursor, so it
+    timed out at every cursor past 2024-10 and no page size or time window
+    helped. Paging must therefore never depend on `or` at all."""
+    _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 2)
+    fills = [_fill(START_TS + i * 3600, f"0x{i:02d}", "1", 1_000_000)
+             for i in range(9)]
+    store = VolumeStore(tmp_path)
+    client = _OrKeysetTimesOut(fills)
+    assert pv.sweep(client, store) is True
+    assert all("or" not in c["variables"]["where"] for c in client.calls)
+    df = pd.read_parquet(store.final_path)
+    assert df["notional_usd"].sum() == pytest.approx(9.0)
+
+
+def test_dense_timestamp_straddling_page_boundaries_is_swept_exactly_once(
+        monkeypatch, tmp_path):
+    """A timestamp with far more fills than one page is the case the
+    tie-break exists for: paging must drain it fully before stepping past
+    it (no gap) and must not re-read rows it already consumed (no
+    duplicate). Live, one sampled timestamp carried 82 fills."""
+    _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 3)
+    # 7 fills on one timestamp (pages of 3 => straddles two boundaries),
+    # flanked by neighbours one second either side.
+    fills = ([_fill(START_TS, "0xaa", "1", 1_000_000)]
+             + [_fill(START_TS + 1, f"0xb{i}", "1", 1_000_000)
+                for i in range(7)]
+             + [_fill(START_TS + 2, "0xcc", "1", 1_000_000)])
+    store = VolumeStore(tmp_path)
+    assert pv.sweep(_FakeGoldsky(fills), store) is True
+    df = pd.read_parquet(store.final_path)
+    assert df["notional_usd"].sum() == pytest.approx(9.0)  # all 9, once each
+
+
+def test_dense_timestamp_is_drained_across_a_portion_restart(
+        monkeypatch, tmp_path):
+    """The same boundary, but with the process dying mid-timestamp: the
+    committed cursor must resume INSIDE the dense timestamp rather than
+    skipping its remaining fills."""
+    _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 2)
+    fills = ([_fill(START_TS, f"0xb{i}", "1", 1_000_000) for i in range(5)]
+             + [_fill(START_TS + 1, "0xcc", "1", 2_000_000)])
+    store = VolumeStore(tmp_path)
+    assert pv.sweep(_FakeGoldsky(fills), store, max_pages=1) is False
+    state = json.loads((tmp_path / "volumes_cursor.json").read_text())
+    cursor = state["cursor"]
+    assert cursor == {"ts": str(START_TS), "id": "0xb1"}  # mid-timestamp
+    assert pv.sweep(_FakeGoldsky(fills), store) is True
+    df = pd.read_parquet(store.final_path)
+    assert df["notional_usd"].sum() == pytest.approx(7.0)  # 5x1 + 2, no loss
+
+
+def test_on_disk_cursor_from_the_or_era_resumes_unchanged(
+        monkeypatch, tmp_path):
+    """The fix must not orphan the ~16h of crawl already on disk: the
+    cursor is the same {ts, id} shape it always was, so a state file
+    written by the `or` build resumes mid-sweep with its fill count and
+    flush sequence intact."""
+    _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 5)
+    fills = [_fill(START_TS, "0xa", "1", 1_000_000),   # already swept
+             _fill(START_TS, "0xb", "1", 2_000_000),   # already swept
+             _fill(START_TS, "0xc", "1", 4_000_000),   # tie-drain picks up
+             _fill(START_TS + 86400, "0xd", "1", 8_000_000)]
+    (tmp_path / "volumes_cursor.json").write_text(json.dumps(
+        {"cursor": {"ts": str(START_TS), "id": "0xb"}, "seq": 16,
+         "n": 3569700, "endpoint": config.GOLDSKY_URL}))
+    store = VolumeStore(tmp_path)
+    client = _FakeGoldsky(fills)
+    assert pv.sweep(client, store) is True
+    # Resumed, not restarted: no query reaches back before the cursor.
+    assert client.calls[0]["variables"]["where"] == {
+        "timestamp": str(START_TS), "id_gt": "0xb"}
+    assert all("timestamp_gte" not in c["variables"]["where"]
+               for c in client.calls)
+    df = pd.read_parquet(store.final_path)
+    assert df["notional_usd"].sum() == pytest.approx(12.0)  # only 0xc + 0xd
+    manifest = json.loads((tmp_path / "volumes_manifest.json").read_text())
+    assert manifest["n_fills"] == 3569700 + 2  # prior count carried forward
+
+
+class _TimesOutOncePerSize(_FakeGoldsky):
+    """Transient load: the first oversized request at each page size above
+    the floor fails, so the sizer must halve to make progress, and the
+    floor always serves. A second attempt at the same size succeeds, so a
+    sizer that climbs back recovers its throughput and one that does not
+    stays pinned."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.burned = set()
+
+    def _fills_page(self, var):
+        first = var["first"]
+        if first > pv.MIN_PAGE_SIZE and first not in self.burned:
+            self.burned.add(first)
+            return _FakeResponse(
+                {"errors": [{"message": "statement timeout"}]})
+        return super()._fills_page(var)
+
+
+def test_page_size_recovers_after_a_transient_timeout(monkeypatch, tmp_path):
+    """Every query the sweep issues is now flat in depth, so a timeout is
+    transient load rather than a property of the query shape. Pinning the
+    rest of a multi-million-row sweep at the floor for one blip is the
+    behaviour being fixed: the sizer must climb back to the ceiling."""
+    _no_sleep(monkeypatch)
+    _relax_completion_guards(monkeypatch)
+    monkeypatch.setattr(config, "GOLDSKY_PAGE_SIZE", 8)
+    monkeypatch.setattr(pv, "MIN_PAGE_SIZE", 2)
+    monkeypatch.setattr(pv, "RECOVER_PAGES", 2)
+    fills = [_fill(START_TS + i * 3600, f"0x{i:02d}", "1", 1_000_000)
+             for i in range(40)]
+    client = _TimesOutOncePerSize(fills)
+    assert pv.sweep(client, VolumeStore(tmp_path)) is True
+    firsts = [c["variables"]["first"] for c in client.calls]
+    assert firsts[:3] == [8, 4, 2]  # halved to a working size
+    assert 4 in firsts[3:] and 8 in firsts[3:]  # then climbed back
+    assert firsts[-1] == 8  # all the way to the ceiling
+    df = pd.read_parquet(tmp_path / "volumes_by_token.parquet")
+    assert df["notional_usd"].sum() == pytest.approx(40.0)  # nothing lost
+
+
+def test_page_sizer_never_exceeds_its_ceiling(monkeypatch):
+    monkeypatch.setattr(pv, "RECOVER_PAGES", 1)
+    sizer = pv._PageSizer(400)
+    for _ in range(20):
+        sizer.grow()
+    assert sizer.size == 400
+    assert sizer.shrink() and sizer.size == 200
+    for _ in range(20):
+        sizer.grow()
+    assert sizer.size == 400  # climbs back, never past
 
 
 class _ShortPageOnce(_FakeGoldsky):

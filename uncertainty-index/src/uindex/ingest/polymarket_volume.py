@@ -41,16 +41,40 @@ Live-verified facts:
   fill-count match, dollar sum matches to the sub-cent (float summation
   noise over 5,327 rows), confirming the scaling rule at scale, not just on
   5 sample rows.
-- `orderBy: timestamp` results are tie-broken by id ascending, and the
-  filter `{or: [{timestamp_gt: ts}, {timestamp: ts, id_gt: id}]}` resumes
-  mid-timestamp exactly, so a (timestamp, id) cursor is lossless. Confirmed
-  again on `orderFilledEvents`: `OrderFilledEvent_filter` exposes the same
-  `id_gt`/`timestamp_gt`/`timestamp_gte`/`and`/`or` fields.
+- `orderBy: timestamp` results are tie-broken by id ascending, so a
+  (timestamp, id) cursor is lossless. `OrderFilledEvent_filter` exposes
+  `id_gt`/`timestamp`/`timestamp_gt`/`timestamp_gte`/`and`/`or`.
+- (2026-08-03) The `{or: [{timestamp_gt: ts}, {timestamp: ts, id_gt: id}]}`
+  keyset resumes at the right row but is NOT SARGABLE, and that killed the
+  sweep dead at 3.57M fills. A bare `or` gives the store no seekable range
+  on (timestamp, id): it walks the index from the start of the table and
+  discards every row before the cursor, so page latency is linear in scan
+  DEPTH and independent of `first:`. Measured on this deployment, 500-row
+  pages: 0.34s at a 2024-01 cursor, 0.65s at 2024-06, 1.96s at 2024-08-06
+  (where the sweep stalled), then `statement timeout` at EVERY cursor from
+  2024-10 onward — i.e. the whole remaining 20 months was unreachable, not
+  one unlucky position. `first: 1` cost the same 1.9s as `first: 500`, and
+  bounding the window with `timestamp_lt` did not help, because neither
+  changes the discarded prefix.
+  The mechanism was confirmed by a discriminating probe: ANDing a redundant
+  `timestamp_gte` onto the identical `or` (same result set, now with a
+  seekable lower bound) returned in 0.14s where the bare `or` timed out.
+  So the sweep issues no `or` at all — see `_fetch_fills`, which splits the
+  keyset into two sargable queries whose union is exactly the `or`'s result
+  set: `{timestamp: ts, id_gt: id}` (drain the cursor's own timestamp) then
+  `{timestamp_gt: ts}` (everything strictly after). Both are flat in depth:
+  0.08-0.14s at 2024-01 through 2026-04 alike. Verified live that the split
+  reproduces the `or`'s 500 rows in identical (timestamp, id) order with no
+  duplicates, and that draining an 82-fill timestamp two rows at a time via
+  `id_gt` returns that timestamp's full set, in order, exactly once.
 - 1000-row pages with a nested join (the old `market { id }` lookup)
   deterministically hit the store's statement timeout; 500 returns in <1s,
   100 in ~0.3s. `orderFilledEvents` has no join at all and 500-row pages
-  ran in ~0.3s live, but the adaptive halving logic is kept defensively —
-  see `_fetch_fills`.
+  ran in ~0.3s live, but the adaptive sizing is kept defensively — see
+  `_PageSizer`. Now that no query shape is depth-dependent, a timeout is a
+  transient load signal rather than a permanent property of the query, so
+  the sizer recovers upward instead of pinning the rest of a
+  multi-million-row sweep at the floor.
 - `marketData(id: token).condition.id` links token -> condition, and
   `marketDatas(where: {condition_in: [...]})` returns both outcome tokens
   per condition. Live-confirmed (2026-08-02) that `orderbook-subgraph`
@@ -103,6 +127,7 @@ OUT_DIR = config.DATA_DIR / "raw" / "polymarket"
 BUCKETS = 16         # final sum-merge holds one bucket in RAM, never the sweep
 FLUSH_PAGES = 500    # pages aggregated in RAM between shard commits
 MIN_PAGE_SIZE = 100  # verified fast; a timeout below this is a real outage
+RECOVER_PAGES = 50   # clean pages before the sizer steps back up
 TOKEN_MAP_CHUNK = 200
 MAX_MARKETS_WAITS = 10  # 60s polls for markets.parquet before giving up
 ASSEMBLE_BATCH_ROWS = 65_536  # rows held in RAM per assemble pass-1 batch
@@ -149,34 +174,87 @@ def _post(client: httpx.Client, query: str, variables: dict) -> dict:
     return j["data"]
 
 
-def _fetch_fills(client: httpx.Client, where: dict,
-                 size: int) -> tuple[list[dict], int]:
-    """Fetch one page, halving the page size on a store failure (the
-    1000-row nested-join page times out deterministically, see docstring).
-    Returns (rows, size_used) so the caller keeps the working size."""
+class _PageSizer:
+    """Adaptive page size for one portion's sweep.
+
+    Halves on a store failure down to MIN_PAGE_SIZE, below which a timeout
+    is a real outage rather than a page too large, and steps back up after
+    RECOVER_PAGES clean pages. The recovery matters because every query the
+    sweep now issues is sargable and flat in depth (see module docstring):
+    a timeout is therefore transient load, and pinning the page size at the
+    floor for the remaining millions of rows would multiply the request
+    count sevenfold for one blip."""
+
+    def __init__(self, size: int):
+        self.size = self._ceiling = size
+        self._clean = 0
+
+    def shrink(self) -> bool:
+        """Halve after a store failure. False at the floor: caller raises."""
+        if self.size <= MIN_PAGE_SIZE:
+            return False
+        self.size = max(self.size // 2, MIN_PAGE_SIZE)
+        self._clean = 0
+        return True
+
+    def grow(self) -> None:
+        if self.size >= self._ceiling:
+            return
+        self._clean += 1
+        if self._clean >= RECOVER_PAGES:
+            self.size = min(self.size * 2, self._ceiling)
+            self._clean = 0
+
+
+def _page(client: httpx.Client, where: dict,
+          sizer: _PageSizer) -> list[dict]:
     while True:
         try:
-            data = _post(client, FILLS_QUERY, {"first": size, "where": where})
-            return data["orderFilledEvents"], size
+            data = _post(client, FILLS_QUERY,
+                         {"first": sizer.size, "where": where})
         except GoldskyQueryError:
-            if size <= MIN_PAGE_SIZE:
+            if not sizer.shrink():
                 raise
-            size = max(size // 2, MIN_PAGE_SIZE)
+            continue
+        sizer.grow()
+        return data["orderFilledEvents"]
+
+
+def _start_ts() -> str:
+    return str(int(datetime.fromisoformat(config.BACKFILL_START)
+                   .replace(tzinfo=timezone.utc).timestamp()))
+
+
+def _fetch_fills(client: httpx.Client, cursor: dict | None,
+                 sizer: _PageSizer) -> list[dict]:
+    """Next page of fills strictly after `cursor` in (timestamp, id) order.
+
+    Issued as two sargable queries rather than the one `or` keyset that
+    stalled this sweep at 3.57M fills (see module docstring): the store
+    cannot seek on a bare `or`, so its cost grew with scan depth until it
+    exceeded the statement timeout for every cursor past 2024-10.
+
+    The two predicates are disjoint and their union is exactly the `or`'s:
+    rows AT the cursor's timestamp that it has not consumed, then rows
+    strictly after it. Every row of the first sorts before every row of the
+    second, so returning the tie-drain alone is a correctly ordered page —
+    and only once it comes back empty is that timestamp fully consumed and
+    safe to step past. An empty result here therefore means both are empty,
+    which is genuine exhaustion, not a truncated page.
+    """
+    if cursor is not None:
+        rows = _page(client, {"timestamp": cursor["ts"],
+                              "id_gt": cursor["id"]}, sizer)
+        if rows:
+            return rows
+        return _page(client, {"timestamp_gt": cursor["ts"]}, sizer)
+    return _page(client, {"timestamp_gte": _start_ts()}, sizer)
 
 
 def _write_json(path: Path, payload: dict) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(payload))
     os.replace(tmp, path)
-
-
-def _where(cursor: dict | None) -> dict:
-    if cursor is None:
-        start = int(datetime.fromisoformat(config.BACKFILL_START)
-                    .replace(tzinfo=timezone.utc).timestamp())
-        return {"timestamp_gte": str(start)}
-    return {"or": [{"timestamp_gt": cursor["ts"]},
-                   {"timestamp": cursor["ts"], "id_gt": cursor["id"]}]}
 
 
 class VolumeStore:
@@ -370,11 +448,11 @@ def sweep(client: httpx.Client, store: VolumeStore,
     sweep is the price of not being able to confuse the two.
     """
     cursor, seq, n = store.resume()
-    size = config.GOLDSKY_PAGE_SIZE
+    sizer = _PageSizer(config.GOLDSKY_PAGE_SIZE)
     acc: dict[tuple[str, int], float] = {}
     pages = 0
     while max_pages is None or pages < max_pages:
-        rows, size = _fetch_fills(client, _where(cursor), size)
+        rows = _fetch_fills(client, cursor, sizer)
         for f in rows:
             token_id, notional = _token_and_notional(f)
             key = (token_id, int(f["timestamp"]) // 86400)
